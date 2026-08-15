@@ -1,0 +1,24 @@
+# Local credentials / configuration
+.env
+config.json
+
+# Runtime state (experience memory, trajectory, research states)
+.wqb_state/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs / temp
+*.log
+*.tmp

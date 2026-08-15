@@ -1,0 +1,24 @@
+{
+  "simulation": {
+    "instrumentType": "EQUITY",
+    "region": "USA",
+    "universe": "TOP3000",
+    "delay": 1,
+    "decay": 0,
+    "neutralization": "SUBINDUSTRY",
+    "truncation": 0.08,
+    "pasteurization": "ON",
+    "unitHandling": "VERIFY",
+    "nanHandling": "ON"
+  },
+  "agent": {
+    "max_rounds": 5,
+    "candidates_per_round": 6,
+    "max_concurrent_sims": 3,
+    "fields_per_discovery": 6,
+    "pagination_limit": 50,
+    "max_pagination_pages": 20,
+    "state_dir": ".wqb_state",
+    "poll_timeout_sec": 900
+  }
+}
