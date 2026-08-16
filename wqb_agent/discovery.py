@@ -56,7 +56,6 @@ class FieldDiscovery:
         self.client = client
         self.pagination_limit = pagination_limit
         self.max_pages = max_pages
-        self._cache = {}
 
     def categorize_hypothesis(self, hypothesis):
         text = hypothesis.get("statement", "")
@@ -73,23 +72,26 @@ class FieldDiscovery:
             scores.keys(), key=lambda c: (scores[c], CATEGORY_VALUE[c]), reverse=True
         )
 
-    def _fields_for(self, dataset_id):
-        if dataset_id in self._cache:
-            return self._cache[dataset_id]
-        collected = []
+    def _scored_fields(self, dataset_id, keywords, need, seen):
+        ranked = []
         offset = 0
         total = None
         for _ in range(self.max_pages):
             results, count = self.client.get_datafields(
                 dataset_id, limit=self.pagination_limit, offset=offset
             )
-            collected.extend(results)
             total = count
-            if not results or len(collected) >= total:
-                break
+            for field in results:
+                if field.get("id") in seen:
+                    continue
+                score = self._score_field(field, keywords)
+                if score > 0:
+                    ranked.append((score, field))
             offset += len(results)
-        self._cache[dataset_id] = collected
-        return collected
+            if not results or (total and offset >= total) or len(ranked) >= need:
+                break
+        ranked.sort(key=lambda x: -x[0])
+        return ranked[:need]
 
     def _score_field(self, field, keywords):
         haystack_id = field.get("id", "").lower()
@@ -139,17 +141,14 @@ class FieldDiscovery:
                 if len(chosen) >= target_count:
                     break
                 try:
-                    fields = self._fields_for(dataset_id)
+                    ranked = self._scored_fields(
+                        dataset_id,
+                        keywords,
+                        need=target_count - len(chosen),
+                        seen=seen,
+                    )
                 except Exception:
                     continue
-                ranked = []
-                for field in fields:
-                    if field.get("id") in seen:
-                        continue
-                    score = self._score_field(field, keywords)
-                    if score > 0:
-                        ranked.append((score, field))
-                ranked.sort(key=lambda x: -x[0])
                 for score, field in ranked:
                     if len(chosen) >= target_count:
                         break

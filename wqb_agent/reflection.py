@@ -1,6 +1,3 @@
-import re
-
-
 class Reflector:
     def __init__(self, memory, success_sharpe=1.0, promising_sharpe=0.5):
         self.memory = memory
@@ -111,10 +108,7 @@ class Reflector:
 
     @staticmethod
     def _direction_key(exp):
-        mutation = exp.to_dict().get("hypothesis_id", "")
-        expr = exp.expression
-        key = expr[:80]
-        return key
+        return exp.expression[:80]
 
     def _score(self, exp):
         metrics = exp.metrics or {}
