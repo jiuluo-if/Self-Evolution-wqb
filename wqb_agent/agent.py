@@ -103,7 +103,6 @@ class Agent:
         )
         if not fields:
             print("No fields discovered; skipping round.")
-            self._remember_direction(round_no, hypothesis)
             return None
         print(f"Fields ({len(fields)}): {[f['id'] for f in fields]}")
 
@@ -129,7 +128,6 @@ class Agent:
             self._print_experiment(exp)
 
         summary = self.reflector.reflect(round_no, hypothesis, experiments)
-        self._remember_direction(round_no, hypothesis)
         state = ResearchState(
             round_no=round_no,
             hypothesis=hypothesis,
@@ -164,13 +162,6 @@ class Agent:
 
     def _used_hypothesis_ids(self):
         return {e.hypothesis_id for e in self.trajectory.experiments}
-
-    def _remember_direction(self, round_no, hypothesis):
-        self.memory.add_avoid(
-            f"hypothesis:{hypothesis['id']}",
-            "seed direction attempted this round",
-            round_no,
-        )
 
     def _attach_candidate_meta(self, experiment, candidate):
         experiment.hypothesis_id = candidate.get("parent") or experiment.hypothesis_id

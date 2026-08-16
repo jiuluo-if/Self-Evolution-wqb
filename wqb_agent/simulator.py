@@ -8,16 +8,7 @@ class Simulator:
         self.poll_timeout_sec = poll_timeout_sec
 
     def run(self, experiments):
-        done = []
-        pending = list(experiments)
-        while pending:
-            batch = pending[: self.max_concurrent]
-            pending = pending[self.max_concurrent :]
-            done.extend(self._run_batch(batch))
-        return done
-
-    def _run_batch(self, experiments):
-        with ThreadPoolExecutor(max_workers=len(experiments)) as pool:
+        with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
             futures = {
                 pool.submit(self._simulate_one, exp): exp for exp in experiments
             }

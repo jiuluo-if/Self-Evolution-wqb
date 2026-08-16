@@ -75,11 +75,12 @@ class CandidateBuilder:
                 break
         group = self.neutralization
         candidates = []
-        mutations = []
+        seen_exprs = {best_expr}
 
         def add(expression, rationale, mutation):
-            if expression == best_expr or expression in [c["expression"] for c in candidates]:
+            if expression in seen_exprs:
                 return
+            seen_exprs.add(expression)
             candidates.append(
                 {
                     "expression": expression,
@@ -109,7 +110,7 @@ class CandidateBuilder:
             f"neutralize-{group}",
         )
 
-        new_window = self._next_window(best_expr, primary)
+        new_window = self._next_window(best_expr)
         if new_window:
             add(
                 new_window,
@@ -139,7 +140,7 @@ class CandidateBuilder:
         return candidates[:count]
 
     @staticmethod
-    def _next_window(expression, primary_field):
+    def _next_window(expression):
         pattern = re.compile(
             r"(ts_(?:rank|mean|std_dev|sum|delta|min|max)\([^,]+,\s*)(\d+)"
         )

@@ -94,6 +94,8 @@ class ExperienceMemory:
             if item["idea"] == idea:
                 item["priority"] = max(item["priority"], priority)
                 item["source"] = source
+                item["round"] = round_no
+                item["updated"] = time.time()
                 return item
         self.next.append(
             {
@@ -103,6 +105,7 @@ class ExperienceMemory:
                 "source": source,
                 "round": round_no,
                 "created": time.time(),
+                "updated": time.time(),
             }
         )
 

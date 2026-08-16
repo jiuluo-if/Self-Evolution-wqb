@@ -1,5 +1,5 @@
-import json
 import os
+import threading
 import time
 
 import requests
@@ -48,31 +48,37 @@ class WQBClient:
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
         self._authenticated = False
+        self._auth_lock = threading.Lock()
 
-    def _authenticate(self):
-        resp = self.session.post(
-            f"{self.base_url}/authentication",
-            json={"username": self.username, "password": self.password},
-            allow_redirects=False,
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            self._authenticated = True
-            return
-        if resp.status_code in (301, 302, 303):
-            self._authenticated = True
-            return
-        if resp.status_code == 401:
-            raise WQBAuthError("Authentication rejected by WorldQuant BRAIN (401).")
-        if resp.status_code == 429:
-            retry = float(resp.headers.get("Retry-After", 5))
-            time.sleep(min(retry, 30))
-            return self._authenticate()
-        raise WQBAuthError(f"Authentication failed with status {resp.status_code}.")
+    def _authenticate(self, max_retries=5):
+        attempt = 0
+        while True:
+            attempt += 1
+            resp = self.session.post(
+                f"{self.base_url}/authentication",
+                json={"username": self.username, "password": self.password},
+                allow_redirects=False,
+                timeout=30,
+            )
+            if resp.status_code == 200 or resp.status_code in (301, 302, 303):
+                self._authenticated = True
+                return
+            if resp.status_code == 401:
+                raise WQBAuthError("Authentication rejected by WorldQuant BRAIN (401).")
+            if resp.status_code == 429:
+                retry = float(resp.headers.get("Retry-After", 5))
+                time.sleep(min(retry, 30))
+            else:
+                raise WQBAuthError(f"Authentication failed with status {resp.status_code}.")
+            if attempt >= max_retries:
+                raise WQBAuthError("Authentication failed after repeated rate limiting.")
 
     def _ensure_auth(self):
-        if not self._authenticated:
-            self._authenticate()
+        if self._authenticated:
+            return
+        with self._auth_lock:
+            if not self._authenticated:
+                self._authenticate()
 
     def _get(self, path, params=None, max_retries=3):
         self._ensure_auth()
@@ -108,35 +114,42 @@ class WQBClient:
         payload = resp.json()
         return payload.get("results", []), payload.get("count", 0)
 
-    def submit_simulation(self, expression, settings, alpha_type="REGULAR"):
+    def submit_simulation(self, expression, settings, alpha_type="REGULAR", max_retries=5):
         self._ensure_auth()
         body = {"type": alpha_type, "settings": settings, "regular": expression}
-        resp = self.session.post(
-            f"{self.base_url}/simulations", json=body, timeout=60
-        )
-        if resp.status_code == 429:
-            retry = float(resp.headers.get("Retry-After", 5))
-            time.sleep(min(retry, 30))
-            return self.submit_simulation(expression, settings, alpha_type)
-        if resp.status_code in (400, 422):
-            raise WQBSimulationError(
-                f"Simulation rejected ({resp.status_code}): {resp.text[:500]}"
+        attempt = 0
+        while True:
+            attempt += 1
+            resp = self.session.post(
+                f"{self.base_url}/simulations", json=body, timeout=60
             )
-        if resp.status_code == 401:
-            self._authenticated = False
-            self._ensure_auth()
-            return self.submit_simulation(expression, settings, alpha_type)
-        if resp.status_code >= 500:
-            time.sleep(2)
-            return self.submit_simulation(expression, settings, alpha_type)
-        if resp.status_code != 201 and resp.status_code != 200:
-            raise WQBSimulationError(
-                f"Simulation submit failed ({resp.status_code}): {resp.text[:500]}"
-            )
-        location = resp.headers.get("Location")
-        if not location:
-            raise WQBSimulationError("Simulation response missing Location header.")
-        return location
+            if resp.status_code in (201, 200):
+                location = resp.headers.get("Location")
+                if not location:
+                    raise WQBSimulationError(
+                        "Simulation response missing Location header."
+                    )
+                return location
+            if resp.status_code == 429:
+                retry = float(resp.headers.get("Retry-After", 5))
+                time.sleep(min(retry, 30))
+            elif resp.status_code == 401:
+                self._authenticated = False
+                self._ensure_auth()
+            elif resp.status_code in (400, 422):
+                raise WQBSimulationError(
+                    f"Simulation rejected ({resp.status_code}): {resp.text[:500]}"
+                )
+            elif resp.status_code >= 500:
+                time.sleep(2)
+            else:
+                raise WQBSimulationError(
+                    f"Simulation submit failed ({resp.status_code}): {resp.text[:500]}"
+                )
+            if attempt >= max_retries:
+                raise WQBSimulationError(
+                    f"Simulation submit failed after {max_retries} attempts."
+                )
 
     def poll_progress(self, progress_url, timeout_sec=900):
         start = time.time()
