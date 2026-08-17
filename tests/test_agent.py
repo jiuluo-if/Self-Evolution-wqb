@@ -205,36 +205,70 @@ class TestFieldDiscovery(unittest.TestCase):
 
 
 class TestCandidateBuilder(unittest.TestCase):
-    def test_from_scratch_returns_six(self):
+    def test_explore_from_scratch(self):
         builder = CandidateBuilder(neutralization="subindustry")
         fields = [{"id": "returns"}, {"id": "volume"}]
         hypothesis = {"direction": "reversal", "tags": ["return"]}
         candidates = builder.build(hypothesis, fields, None, count=6)
         self.assertEqual(len(candidates), 6)
-        self.assertTrue(all("returns" in c["expression"] for c in candidates))
+        explore = [c for c in candidates if c["mutation"] == "explore"]
+        deepen = [c for c in candidates if c["mutation"] != "explore"]
+        self.assertEqual(len(explore), 6)
+        self.assertEqual(len(deepen), 0)
+        self.assertTrue(all(c["parent"] is None for c in candidates))
 
-    def test_reversal_flips_sign(self):
-        builder = CandidateBuilder()
-        fields = [{"id": "returns"}]
-        candidates = builder.build(
-            {"direction": "reversal"}, fields, None, count=2
-        )
-        self.assertTrue(candidates[0]["expression"].startswith("-rank"))
-
-    def test_mutates_best_single_variable(self):
+    def test_build_pools_splits_explore_and_deepen(self):
         builder = CandidateBuilder()
         fields = [{"id": "returns"}, {"id": "volume"}]
         best = {
             "id": "b1",
             "expression": "rank(returns)",
             "fields_used": ["returns"],
+            "lineage": [],
+            "attempts": 0,
             "metrics": {"sharpe": 0.6, "fitness": 0.6},
         }
-        candidates = builder.build({}, fields, best, count=6)
-        exprs = [c["expression"] for c in candidates]
-        self.assertNotIn("rank(returns)", exprs)
-        self.assertEqual(len(exprs), 6)
-        self.assertTrue(all(c["parent"] == "b1" for c in candidates))
+        candidates = builder.build_pools(
+            {}, fields, [best], total=6, explore_ratio=0.5
+        )
+        explore = [c for c in candidates if c["mutation"] == "explore"]
+        deepen = [c for c in candidates if c["mutation"] != "explore"]
+        self.assertEqual(len(candidates), 6)
+        self.assertGreater(len(explore), 0)
+        self.assertGreater(len(deepen), 0)
+        self.assertTrue(all(c["parent"] == "rank(returns)" for c in deepen))
+
+    def test_reversal_flips_sign(self):
+        builder = CandidateBuilder()
+        fields = [{"id": "returns"}]
+        candidates = builder.build_explore({"direction": "reversal"}, fields, 1)
+        self.assertTrue(candidates[0]["expression"].startswith("-rank"))
+
+    def test_deepen_respects_max_attempts(self):
+        builder = CandidateBuilder(max_deepen_per_lineage=2)
+        fields = [{"id": "returns"}, {"id": "volume"}]
+        alpha = {
+            "expression": "rank(returns)",
+            "lineage": [],
+            "attempts": 2,
+            "best_score": 0.6,
+        }
+        self.assertEqual(builder.build_deepen(fields, [alpha], 4), [])
+
+    def test_deepen_lineage_recorded(self):
+        builder = CandidateBuilder()
+        fields = [{"id": "returns"}, {"id": "volume"}]
+        alpha = {
+            "expression": "rank(ts_mean(returns, 5))",
+            "lineage": ["rank(returns)"],
+            "attempts": 1,
+            "best_score": 1.1,
+        }
+        cands = builder.build_deepen(fields, [alpha], 3)
+        self.assertGreater(len(cands), 0)
+        for c in cands:
+            self.assertEqual(c["lineage"][0], "rank(ts_mean(returns, 5))")
+            self.assertEqual(c["lineage"][1], "rank(returns)")
 
 
 class TestSimulator(unittest.TestCase):
@@ -277,6 +311,7 @@ class TestReflection(unittest.TestCase):
         self.assertEqual(memory.current_best["expression"], "rank(ts_mean(returns, 5))")
         self.assertGreater(len(memory.lessons), 0)
         self.assertIn("SUCCESS", summary["verdicts"])
+        self.assertGreaterEqual(len(memory.submission_pool), 1)
 
     def test_fail_diagnosis_adds_avoid(self):
         memory = ExperienceMemory(state_dir="/tmp/wqb_test_mem2")
@@ -287,6 +322,40 @@ class TestReflection(unittest.TestCase):
         reflector.reflect(1, {"tags": ["price"], "direction": "long"}, [e])
         self.assertEqual(len(memory.avoid), 1)
         self.assertIn("syntax", memory.avoid[0]["reason"])
+
+    def test_suspicious_high_signal_flagged(self):
+        memory = ExperienceMemory(state_dir="/tmp/wqb_test_susp")
+        reflector = Reflector(memory, high_sharpe=2.0, high_fitness=2.0)
+        e = Experiment(1, "h", "rank(ts_mean(returns, 5))", {}, ["returns"])
+        e.metrics = {
+            "sharpe": 3.0,
+            "fitness": 3.0,
+            "turnover": 0.3,
+            "checks": [{"name": "limitations", "pass": True}],
+        }
+        e.status = "DONE"
+        summary = reflector.reflect(1, {"tags": ["return"]}, [e])
+        self.assertEqual(summary["verdicts"].get("SUSPICIOUS"), 1)
+        self.assertEqual(len(summary["suspicious"]), 1)
+        self.assertEqual(
+            summary["suspicious"][0]["status"], "SUSPICIOUS_HIGH_SIGNAL"
+        )
+
+    def test_pool_rejects_redundant(self):
+        memory = ExperienceMemory(state_dir="/tmp/wqb_test_pool")
+        reflector = Reflector(memory)
+        exps = []
+        for expr in [
+            "rank(ts_mean(returns, 5))",
+            "rank(ts_mean(volume, 5))",
+            "rank(ts_mean(close, 5))",
+        ]:
+            e = Experiment(1, "h", expr, {}, ["returns", "volume", "close"])
+            e.metrics = _fake_metrics(expr)
+            e.status = "DONE"
+            exps.append(e)
+        reflector.reflect(1, {"tags": ["return"], "direction": "long"}, exps)
+        self.assertEqual(len(memory.submission_pool), 1)
 
 
 class TestMemory(unittest.TestCase):
@@ -306,8 +375,178 @@ class TestMemory(unittest.TestCase):
         memory.compress()
         self.assertEqual(len(memory.lessons), 1)
 
+    def test_lesson_promotion_to_long_term(self):
+        memory = ExperienceMemory(state_dir="/tmp/wqb_test_tier")
+        memory.add_lesson("Field returns ranks weakly", 1, evidence=2)
+        memory.add_lesson("Field returns ranks weakly", 2, evidence=2)
+        lesson = memory.lessons[0]
+        self.assertEqual(lesson["tier"], "long")
+        self.assertGreaterEqual(lesson["evidence"], memory.promote_evidence)
+
+    def test_stale_short_lesson_archived(self):
+        memory = ExperienceMemory(state_dir="/tmp/wqb_test_stale")
+        memory.add_lesson("Transient observation", 1, evidence=1)
+        memory.updated_round = 5
+        memory.compress()
+        kinds = {g["kind"] for g in memory.garbage}
+        self.assertIn("stale_short_lesson", kinds)
+
+    def test_garbage_archive(self):
+        memory = ExperienceMemory(state_dir="/tmp/wqb_test_garbage")
+        memory.archive("repeat_fail", "rank(close)", 1)
+        memory.archive("unreproducible_high_signal", "rank(x)", 2)
+        self.assertEqual(len(memory.garbage), 2)
+
+    def test_lineage_deepen_attempts_tracked(self):
+        memory = ExperienceMemory(state_dir="/tmp/wqb_test_lineage")
+        memory.touch_lineage("rank(returns)", [], 0.6, 1)
+        memory.touch_lineage("rank(returns)", [], 0.8, 2)
+        self.assertEqual(memory.lineage_attempts("rank(returns)"), 2)
+        targets = memory.deepening_targets(max_deepen_per_lineage=3, limit=4)
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0]["best_score"], 0.8)
+
+
+class TestDiversity(unittest.TestCase):
+    def test_redundancy_detected(self):
+        from wqb_agent.diversity import is_redundant
+
+        record = {
+            "expression": "rank(ts_mean(returns, 10))",
+            "fields_used": ["returns"],
+        }
+        pool = [
+            {
+                "expression": "rank(ts_mean(returns, 5))",
+                "fields_used": ["returns"],
+                "metrics": {"sharpe": 1.0, "fitness": 1.0},
+            }
+        ]
+        redundant, keeper = is_redundant(record, pool)
+        self.assertTrue(redundant)
+        self.assertEqual(keeper["expression"], "rank(ts_mean(returns, 5))")
+
+    def test_dedup_keeps_best(self):
+        from wqb_agent.diversity import deduplicate
+
+        pool = [
+            {
+                "expression": "rank(ts_mean(returns, 5))",
+                "fields_used": ["returns"],
+                "metrics": {"sharpe": 1.0, "fitness": 1.0},
+            },
+            {
+                "expression": "rank(ts_mean(returns, 10))",
+                "fields_used": ["returns"],
+                "metrics": {"sharpe": 1.2, "fitness": 1.2},
+            },
+            {
+                "expression": "-rank(ts_rank(volume, 20))",
+                "fields_used": ["volume"],
+                "metrics": {"sharpe": 1.5, "fitness": 1.5},
+            },
+        ]
+        kept, dropped = deduplicate(pool)
+        self.assertEqual(len(kept), 2)
+        exprs = {r["expression"] for r in kept}
+        self.assertIn("rank(ts_mean(returns, 10))", exprs)
+        self.assertIn("-rank(ts_rank(volume, 20))", exprs)
+        self.assertEqual(len(dropped), 1)
+
+
+class TestHighSignalValidation(unittest.TestCase):
+    def test_stable_signal_validated(self):
+        from wqb_agent.validation import HighSignalValidator
+
+        client = FakeClient()
+        validator = HighSignalValidator(
+            client,
+            {},
+            max_concurrent=3,
+            poll_timeout_sec=30,
+            min_valid_fitness=1.0,
+        )
+        record = {
+            "expression": "rank(ts_mean(returns, 5))",
+            "fields_used": ["returns"],
+            "round_no": 1,
+            "hypothesis_id": "h1",
+            "datasets": [],
+        }
+        stable, details = validator.validate(record, alt_fields=["volume"])
+        self.assertTrue(stable)
+        self.assertGreaterEqual(len(details), 2)
+
+    def test_unstable_signal_rejected(self):
+        from wqb_agent.validation import HighSignalValidator
+
+        class CollapseClient(FakeClient):
+            def get_alpha(self, alpha_id):
+                expression = self._alpha_expr.get(alpha_id, "")
+                metrics = _fake_metrics(expression)
+                # Signal collapses unless the expression keeps its original window.
+                if "returns, 5" not in expression and "ts_mean" in expression:
+                    metrics = {
+                        "sharpe": 0.1,
+                        "fitness": 0.1,
+                        "turnover": 0.5,
+                        "margin": 0.0,
+                        "returns": 0.0,
+                        "checks": [{"name": "limitations", "pass": True}],
+                    }
+                return {"is": metrics, "regular": expression}
+
+        client = CollapseClient()
+        validator = HighSignalValidator(
+            client,
+            {},
+            max_concurrent=3,
+            poll_timeout_sec=30,
+            min_valid_fitness=1.0,
+        )
+        record = {
+            "expression": "rank(ts_mean(returns, 5))",
+            "fields_used": ["returns"],
+            "round_no": 1,
+            "hypothesis_id": "h1",
+            "datasets": [],
+        }
+        stable, details = validator.validate(record, alt_fields=["volume"])
+        self.assertFalse(stable)
+
 
 class TestAgentLoop(unittest.TestCase):
+    def test_high_signal_validated_enters_pool(self):
+        class HighSignalClient(FakeClient):
+            def get_alpha(self, alpha_id):
+                expression = self._alpha_expr.get(alpha_id, "")
+                if "returns" in expression:
+                    metrics = {
+                        "sharpe": 3.0,
+                        "fitness": 3.0,
+                        "turnover": 0.3,
+                        "margin": 0.3,
+                        "returns": 0.1,
+                        "checks": [{"name": "limitations", "pass": True}],
+                    }
+                else:
+                    metrics = _fake_metrics(expression)
+                return {"is": metrics, "regular": expression}
+
+        tmpdir = "/tmp/wqb_test_hisig"
+        if os.path.exists(tmpdir):
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    os.remove(os.path.join(root, fn))
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["agent"]["state_dir"] = tmpdir
+        config["agent"]["max_rounds"] = 1
+        agent = Agent(HighSignalClient(), config)
+        agent.run_one_round(1)
+        self.assertGreaterEqual(len(agent.memory.submission_pool), 1)
+        statuses = {r["status"] for r in agent.memory.submission_pool}
+        self.assertIn("VALIDATED_HIGH_SIGNAL", statuses)
+
     def test_full_loop_state_persisted(self):
         tmpdir = "/tmp/wqb_test_agent"
         if os.path.exists(tmpdir):

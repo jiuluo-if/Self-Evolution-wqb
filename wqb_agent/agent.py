@@ -5,10 +5,12 @@ import time
 from .candidate import CandidateBuilder
 from .client import WQBClient
 from .discovery import FieldDiscovery
+from .diversity import deduplicate
 from .memory import ExperienceMemory
 from .reflection import Reflector
 from .simulator import Simulator
-from .state import Experiment, ResearchState, Trajectory
+from .state import AlphaRecord, Experiment, ResearchState, Trajectory
+from .validation import HighSignalValidator
 
 SEED_HYPOTHESES = [
     {
@@ -68,11 +70,27 @@ class Agent:
         self.pagination_limit = agent_cfg.get("pagination_limit", 50)
         self.max_pagination_pages = agent_cfg.get("max_pagination_pages", 20)
         self.poll_timeout_sec = agent_cfg.get("poll_timeout_sec", 900)
+        self.max_concurrent_sims = agent_cfg.get("max_concurrent_sims", 3)
+
+        self.explore_ratio = agent_cfg.get("explore_ratio", 0.5)
+        self.good_sharpe = agent_cfg.get("good_sharpe", 1.0)
+        self.good_fitness = agent_cfg.get("good_fitness", 1.0)
+        self.high_sharpe = agent_cfg.get("high_signal_sharpe", 2.5)
+        self.high_fitness = agent_cfg.get("high_signal_fitness", 2.0)
+        self.max_deepen_per_lineage = agent_cfg.get("max_deepen_per_lineage", 3)
+        self.sim_budget_per_round = agent_cfg.get("sim_budget_per_round", 10)
+        self.validation_budget = agent_cfg.get("validation_budget_per_round", 4)
+        self.discovery_budget_per_round = agent_cfg.get(
+            "discovery_budget_per_round", 8
+        )
 
         self.memory = ExperienceMemory(self.state_dir)
         self.trajectory = Trajectory()
         self.builder = CandidateBuilder(
-            neutralization=self.simulation_settings.get("neutralization", "SUBINDUSTRY")
+            neutralization=self.simulation_settings.get(
+                "neutralization", "SUBINDUSTRY"
+            ),
+            max_deepen_per_lineage=self.max_deepen_per_lineage,
         )
         self.discovery = FieldDiscovery(
             self.client,
@@ -81,10 +99,24 @@ class Agent:
         )
         self.simulator = Simulator(
             self.client,
-            max_concurrent=agent_cfg.get("max_concurrent_sims", 3),
+            max_concurrent=self.max_concurrent_sims,
             poll_timeout_sec=self.poll_timeout_sec,
         )
-        self.reflector = Reflector(self.memory)
+        self.reflector = Reflector(
+            self.memory,
+            good_sharpe=self.good_sharpe,
+            good_fitness=self.good_fitness,
+            high_sharpe=self.high_sharpe,
+            high_fitness=self.high_fitness,
+        )
+        self.validator = HighSignalValidator(
+            self.client,
+            self.simulation_settings,
+            max_concurrent=self.max_concurrent_sims,
+            poll_timeout_sec=self.poll_timeout_sec,
+            min_valid_fitness=self.good_fitness,
+        )
+        self._last_fields = []
 
     def run(self, max_rounds=None):
         rounds = max_rounds or self.max_rounds
@@ -94,28 +126,61 @@ class Agent:
 
     def run_one_round(self, round_no):
         start = time.time()
-        hypothesis = self._form_hypothesis(round_no)
+        self.discovery.reset_budget(self.discovery_budget_per_round)
+        plan = self._plan_round(round_no)
+        hypothesis = plan["hypothesis"]
+        split = plan["split"]
         print(f"\n=== Round {round_no} ===")
         print(f"Hypothesis: {hypothesis['statement']}")
-
-        fields = self.discovery.discover(
-            hypothesis, target_count=self.fields_per_discovery
+        print(
+            f"Pool split: explore={split['explore']} deepen={split['deepen']} "
+            f"(pool={len(self.memory.submission_pool)})"
         )
-        if not fields:
-            print("No fields discovered; skipping round.")
-            return None
+
+        fields = self._last_fields
+        if split["explore"] > 0:
+            fields = self.discovery.discover(
+                hypothesis, target_count=self.fields_per_discovery
+            )
+            if not fields:
+                # Fall back to previously discovered fields (cache reuse).
+                fields = self._last_fields
+            if not fields:
+                print("No fields discovered; skipping round.")
+                return None
+            self._last_fields = fields
         print(f"Fields ({len(fields)}): {[f['id'] for f in fields]}")
 
-        candidates = self.builder.build(
-            hypothesis, fields, self.memory.current_best, self.candidates_per_round
-        )
+        candidates = []
+        if split["explore"] > 0:
+            candidates += self.builder.build_explore(
+                hypothesis, fields, split["explore"]
+            )
+        if split["deepen"] > 0:
+            active = self.memory.deepening_targets(
+                self.max_deepen_per_lineage, limit=4
+            )
+            if active:
+                candidates += self.builder.build_deepen(
+                    fields, active, split["deepen"]
+                )
+
+        budget = self.sim_budget_per_round
+        if candidates:
+            candidates = candidates[:budget]
+        if not candidates:
+            print("No candidates built; skipping round.")
+            return None
+
         experiments = [
             Experiment(
                 round_no,
                 hypothesis["id"],
                 c["expression"],
                 self.simulation_settings,
-                [f["id"] for f in fields],
+                c.get("fields_used") or [f["id"] for f in fields],
+                datasets=hypothesis.get("datasets", []),
+                lineage=c.get("lineage", []),
             )
             for c in candidates
         ]
@@ -128,45 +193,127 @@ class Agent:
             self._print_experiment(exp)
 
         summary = self.reflector.reflect(round_no, hypothesis, experiments)
+
+        validation_used = self._validate_suspicious(summary, round_no)
+        self._dedup_pool(round_no)
+        self._prune_stale_lineages(round_no)
+
         state = ResearchState(
             round_no=round_no,
             hypothesis=hypothesis,
-            dataset=summary.get("datasets"),
+            dataset=hypothesis.get("datasets"),
             fields_used=[f["id"] for f in fields],
         )
         self._save_state(state)
-        self._print_summary(summary, elapsed=time.time() - start)
+        self._print_summary(
+            summary,
+            elapsed=time.time() - start,
+            validation_used=validation_used,
+        )
         return summary
 
-    def _form_hypothesis(self, round_no):
-        next_ideas = self.memory.top_next(1)
-        if next_ideas and self.memory.current_best:
-            best = self.memory.current_best
-            metrics = best.get("metrics") or {}
-            direction = "reversal" if (metrics.get("sharpe") or 0) < 0 else "long"
-            fields = best.get("fields_used") or []
-            tags = ["iterate", "best"]
-            if fields:
-                tags.append(fields[0])
-            return {
-                "id": f"h-iter-r{round_no}",
-                "statement": next_ideas[0]["idea"],
-                "tags": tags,
-                "direction": direction,
-            }
+    # ---- planning ----
+
+    def _plan_round(self, round_no):
+        pool = self.memory.submission_pool
+        n = self.candidates_per_round
+        explore = max(1, int(round(n * self.explore_ratio)))
+        deepen = n - explore
+        if not pool:
+            # Not enough proven directions yet: bias toward exploration.
+            deepen = max(0, deepen - 1)
+            explore = n - deepen
+
+        # Exploration is always driven by a real hypothesis (hypothesis-first),
+        # never by a deepen pseudo-hypothesis with weak field keywords.
         used = self._used_hypothesis_ids()
+        hypothesis = None
         for seed in SEED_HYPOTHESES:
             if seed["id"] not in used:
-                return dict(seed)
-        return dict(SEED_HYPOTHESES[round_no % len(SEED_HYPOTHESES)])
+                hypothesis = dict(seed)
+                break
+        if hypothesis is None:
+            hypothesis = dict(SEED_HYPOTHESES[round_no % len(SEED_HYPOTHESES)])
+        return {"hypothesis": hypothesis, "split": {"explore": explore, "deepen": deepen}}
 
     def _used_hypothesis_ids(self):
         return {e.hypothesis_id for e in self.trajectory.experiments}
 
     def _attach_candidate_meta(self, experiment, candidate):
-        experiment.hypothesis_id = candidate.get("parent") or experiment.hypothesis_id
         experiment.mutation = candidate.get("mutation")
         experiment.rationale = candidate.get("rationale")
+
+    # ---- validation & pool maintenance ----
+
+    def _validate_suspicious(self, summary, round_no):
+        suspicious = summary.get("suspicious") or []
+        if not suspicious:
+            return 0
+        alt_fields = [f["id"] for f in self._last_fields]
+        used = 0
+        for rec in suspicious:
+            if used >= self.validation_budget:
+                break
+            rec_obj = AlphaRecord.from_dict(rec)
+            stable, details = self.validator.validate(rec, alt_fields=alt_fields)
+            used += len(details)
+            if stable:
+                rec_obj.status = "VALIDATED_HIGH_SIGNAL"
+                self.memory.add_alpha(rec_obj)
+                self.memory.touch_lineage(
+                    rec_obj.expression,
+                    rec_obj.lineage,
+                    rec_obj.score,
+                    round_no,
+                    fields_used=rec_obj.fields_used,
+                )
+                print(
+                    f"  [validated] {rec_obj.expression[:60]} "
+                    f"survived perturbation checks"
+                )
+            else:
+                self.memory.archive(
+                    "unreproducible_high_signal", rec_obj.expression, round_no
+                )
+                print(
+                    f"  [rejected] {rec_obj.expression[:60]} "
+                    f"unreproducible under perturbation"
+                )
+        return used
+
+    def _dedup_pool(self, round_no):
+        if len(self.memory.submission_pool) < 2:
+            return
+        kept, dropped = deduplicate(self.memory.submission_pool)
+        self.memory.submission_pool = kept
+        for rec in dropped:
+            self.memory.archive(
+                "redundant_dup",
+                f"{rec['expression']} removed by pool dedup",
+                round_no,
+            )
+
+    def _prune_stale_lineages(self, round_no):
+        """Stop deepening lineages that never improved after several attempts."""
+        pruned = []
+        remaining = []
+        for item in self.memory.active_lineages:
+            if (
+                item.get("attempts", 0) >= self.max_deepen_per_lineage + 1
+                and item.get("best_score", -1) < self.good_fitness
+            ):
+                pruned.append(item)
+            else:
+                remaining.append(item)
+        self.memory.active_lineages = remaining
+        for item in pruned:
+            self.memory.archive(
+                "stale_lineage",
+                f"{item['expression']} gave up after {item.get('attempts')} attempts",
+                round_no,
+            )
+
+    # ---- output ----
 
     def _print_experiment(self, exp):
         if exp.metrics:
@@ -179,9 +326,10 @@ class Agent:
         else:
             print(f"  [{exp.id}] {exp.expression[:70]} FAILED: {exp.error}")
 
-    def _print_summary(self, summary, elapsed=None):
+    def _print_summary(self, summary, elapsed=None, validation_used=0):
         print(
-            f"Round {summary['round']} verdicts: {summary['verdicts']}"
+            f"Round {summary['round']} verdicts: {summary['verdicts']} "
+            f"pool={summary['pool_size']}"
         )
         if summary["best"]:
             b = summary["best"]
@@ -189,8 +337,12 @@ class Agent:
                 f"  best={b['expression'][:70]} sharpe={b.get('sharpe')} "
                 f"fitness={b.get('fitness')}"
             )
+        if validation_used:
+            print(f"  validation sims={validation_used}")
         if elapsed:
             print(f"  elapsed={elapsed:.1f}s")
+
+    # ---- persistence ----
 
     def _load_state(self):
         self.memory.load()
