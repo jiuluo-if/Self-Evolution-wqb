@@ -47,6 +47,8 @@ class ExperienceMemory:
         self.garbage = []  # {kind, reason, round_no, created}
         self.recent_rounds = []  # compact round summaries
         self.updated_round = 0
+        self.created_at = time.time()
+        self.updated_at = time.time()
         self._ensure_dir()
 
     def _ensure_dir(self):
@@ -70,10 +72,19 @@ class ExperienceMemory:
         self.garbage = data.get("garbage", [])
         self.recent_rounds = data.get("recent_rounds", [])
         self.updated_round = data.get("updated_round", 0)
+        self.created_at = data.get("created_at", time.time())
+        self.updated_at = data.get("updated_at", time.time())
+        for lesson in self.lessons:
+            rounds = lesson.get("source_rounds") or []
+            lesson["source_rounds"] = set(rounds)
         return self
 
     def save(self):
+        self.updated_at = time.time()
         data = {
+            "schema_version": 1,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
             "current_best": self.current_best,
             "submission_pool": self.submission_pool,
             "lessons": self.lessons,
@@ -87,49 +98,78 @@ class ExperienceMemory:
         path = self.memory_path()
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, indent=2, default=self._json_default)
         os.replace(tmp, path)
+
+    @staticmethod
+    def _json_default(obj):
+        if isinstance(obj, set):
+            return list(obj)
+        return str(obj)
 
     # ---- lessons (long-term candidates) ----
 
-    def add_lesson(self, claim, source_round, evidence, confidence=0.5):
+    def add_lesson(self, claim, source_round, evidence, confidence=0.5, source=None):
         for lesson in self.lessons:
             if self._similar(lesson["claim"], claim, threshold=0.8):
                 lesson["source_round"] = source_round
                 lesson["evidence"] = lesson.get("evidence", 0) + evidence
                 lesson["confidence"] = min(1.0, lesson.get("confidence", 0) + 0.15)
-                lesson["tier"] = (
-                    "long"
-                    if lesson["evidence"] >= self.promote_evidence
-                    else "short"
-                )
+                lesson.setdefault("source_rounds", set()).add(source_round)
+                self._append_evidence(lesson, source)
+                lesson["tier"] = self._tier_for(lesson)
                 lesson["updated"] = time.time()
                 return lesson
         entry = {
             "id": uuid.uuid4().hex[:8],
             "claim": claim,
             "source_round": source_round,
+            "source_rounds": {source_round},
             "evidence": evidence,
             "confidence": min(confidence, 1.0),
-            "tier": "long" if evidence >= self.promote_evidence else "short",
+            "evidence_log": [],
+            "tier": "short",
             "created": time.time(),
             "updated": time.time(),
         }
+        self._append_evidence(entry, source)
+        entry["tier"] = self._tier_for(entry)
         self.lessons.append(entry)
         return entry
 
-    def add_avoid(self, direction, reason, source_round):
+    def _append_evidence(self, lesson, source, max_log=5):
+        """Record the real experiment behind an evidence increment."""
+        if not source:
+            return
+        log = lesson.setdefault("evidence_log", [])
+        log.insert(0, dict(source))
+        del log[max_log:]
+
+    def _tier_for(self, lesson):
+        """Long-term requires both accumulated evidence AND independent
+        experiments across multiple rounds — a single success must not
+        become long-term by itself."""
+        evidence = lesson.get("evidence", 0)
+        rounds = lesson.get("source_rounds") or set()
+        if evidence >= self.promote_evidence and len(rounds) >= 2:
+            return "long"
+        return "short"
+
+    def add_avoid(self, direction, reason, source_round, source=None):
         for item in self.avoid:
             if item["direction"] == direction:
                 item["reason"] = reason
                 item["source_round"] = source_round
                 item["updated"] = time.time()
+                if source:
+                    item["evidence_log"] = [dict(source)]
                 return item
         entry = {
             "id": uuid.uuid4().hex[:8],
             "direction": direction,
             "reason": reason,
             "source_round": source_round,
+            "evidence_log": [dict(source)] if source else [],
             "created": time.time(),
             "updated": time.time(),
         }

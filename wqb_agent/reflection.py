@@ -1,5 +1,16 @@
 from .diversity import is_redundant
+from .failures import classify_error, is_research_relevant
 from .state import AlphaRecord, score_of
+
+
+def _passed(metrics):
+    """Tri-state pass result: True / False / None (UNKNOWN, no checks)."""
+    checks = metrics.get("checks") or []
+    if metrics.get("passed") is not None:
+        return metrics["passed"]
+    if not checks:
+        return None
+    return all(bool(c.get("pass")) for c in checks)
 
 
 class Reflector:
@@ -42,46 +53,63 @@ class Reflector:
 
     def _classify(self, exp):
         if exp.status == "FAILED":
-            return {"label": "FAIL", "reason": self._diagnose_error(exp)}
+            kind = classify_error(exp.error)
+            return {
+                "label": "FAIL",
+                "kind": kind,
+                "reason": self._diagnose_error(exp),
+            }
         metrics = exp.metrics or {}
-        checks = metrics.get("checks") or []
-        failed_checks = [c["name"] for c in checks if not c["pass"]]
+        passed = _passed(metrics)
+        failed_checks = [
+            c["name"] for c in (metrics.get("checks") or []) if not c["pass"]
+        ]
         sharpe = metrics.get("sharpe")
         fitness = metrics.get("fitness")
         turnover = metrics.get("turnover")
         if sharpe is None:
-            return {"label": "FAIL", "reason": "missing sharpe metric"}
+            return {
+                "label": "FAIL",
+                "kind": "RESEARCH",
+                "reason": "missing sharpe metric",
+            }
 
         reasons = []
-        if failed_checks:
+        if passed is None:
+            reasons.append("no checks returned (UNKNOWN)")
+        elif not passed:
             reasons.append(f"checks failed: {failed_checks}")
         if turnover is not None and turnover > self.max_turnover:
             reasons.append(f"turnover too high: {turnover:.2f}")
 
-        if not failed_checks and (
+        if passed is True and (
             sharpe >= self.high_sharpe
             or (fitness is not None and fitness >= self.high_fitness)
         ):
             return {
                 "label": "SUSPICIOUS",
+                "kind": "RESEARCH",
                 "reason": f"abnormally high signal: sharpe={sharpe}, fitness={fitness}",
             }
 
         if (
-            not failed_checks
+            passed is True
             and sharpe >= self.good_sharpe
             and (fitness is None or fitness >= self.good_fitness)
             and turnover is not None
             and turnover <= self.max_turnover
         ):
-            return {"label": "SUCCESS", "reason": " or ".join(reasons) or "Good alpha"}
+            return {"label": "SUCCESS", "kind": "RESEARCH",
+                    "reason": " or ".join(reasons) or "Good alpha"}
         if sharpe >= self.promising_sharpe:
             return {
                 "label": "PROMISING",
+                "kind": "RESEARCH",
                 "reason": " or ".join(reasons) or "weak positive signal",
             }
         return {
             "label": "FAIL",
+            "kind": "RESEARCH",
             "reason": " or ".join(reasons) or f"sharpe too low: {sharpe:.3f}",
         }
 
@@ -93,13 +121,42 @@ class Reflector:
             return "polling timed out"
         return f"runtime error: {error[:120]}"
 
+    def _source_of(self, exp):
+        metrics = exp.metrics or {}
+        return {
+            "experiment_id": exp.id,
+            "round": exp.round,
+            "hypothesis_id": exp.hypothesis_id,
+            "expression": exp.expression,
+            "mutation": exp.mutation,
+            "fields": list(exp.fields_used),
+            "metrics": {
+                "sharpe": metrics.get("sharpe"),
+                "fitness": metrics.get("fitness"),
+                "turnover": metrics.get("turnover"),
+            }
+            if exp.metrics
+            else None,
+        }
+
     def _learn(self, round_no, hypothesis, exp, verdict):
         if exp.status == "FAILED":
+            kind = verdict.get("kind", "RESEARCH")
+            if not is_research_relevant(kind):
+                # Infrastructure / auth / rate-limit / timeout failures carry no
+                # information about the hypothesis; keep them out of research
+                # memory and garbage.
+                return
             self.memory.add_avoid(
-                self._direction_key(exp), self._diagnose_error(exp), round_no
+                self._direction_key(exp),
+                self._diagnose_error(exp),
+                round_no,
+                source=self._source_of(exp),
             )
             if self.memory.is_avoided(self._direction_key(exp)):
-                self.memory.archive("repeat_fail", self._direction_key(exp), round_no)
+                self.memory.archive(
+                    "repeat_fail", self._direction_key(exp), round_no
+                )
             return
 
         metrics = exp.metrics or {}
@@ -111,8 +168,9 @@ class Reflector:
                 f"Combination {exp.expression} achieves Sharpe {metrics.get('sharpe')} "
                 f"on fields [{field_label}].",
                 round_no,
-                evidence=3,
+                evidence=1,
                 confidence=0.7,
+                source=self._source_of(exp),
             )
         elif verdict["label"] == "SUSPICIOUS":
             self.memory.add_lesson(
@@ -121,6 +179,7 @@ class Reflector:
                 round_no,
                 evidence=1,
                 confidence=0.2,
+                source=self._source_of(exp),
             )
         elif verdict["label"] == "PROMISING":
             self.memory.add_lesson(
@@ -128,6 +187,7 @@ class Reflector:
                 round_no,
                 evidence=1,
                 confidence=0.3,
+                source=self._source_of(exp),
             )
             self.memory.add_next(
                 f"Iterate on [{field_label}] with smoothing / neutralization variants.",
@@ -140,6 +200,7 @@ class Reflector:
                 self._direction_key(exp),
                 f"sharpe={metrics.get('sharpe')}, turnover={metrics.get('turnover')}",
                 round_no,
+                source=self._source_of(exp),
             )
             self.memory.add_lesson(
                 f"Direction on [{field_label}] has no predictive power "
@@ -147,6 +208,7 @@ class Reflector:
                 round_no,
                 evidence=2,
                 confidence=0.4,
+                source=self._source_of(exp),
             )
 
         turnover = metrics.get("turnover")
@@ -157,6 +219,7 @@ class Reflector:
                 round_no,
                 evidence=1,
                 confidence=0.3,
+                source=self._source_of(exp),
             )
 
     def _flag_suspicious(self, results):
@@ -224,24 +287,41 @@ class Reflector:
         return exp.expression[:80]
 
     def _update_best(self, results):
-        done = [r for r in results if r["experiment"].metrics]
-        if not done:
+        """Best may only come from experiments that fully passed WQB checks and
+        are not suspicious high-signal alphas waiting for validation."""
+        eligible = []
+        for r in results:
+            exp = r["experiment"]
+            if exp.metrics is None:
+                continue
+            if r["verdict"]["label"] in ("FAIL", "SUSPICIOUS"):
+                continue
+            if _passed(exp.metrics) is not True:
+                continue
+            eligible.append(exp)
+        if not eligible:
             return self.memory.current_best
-        best_exp = max(done, key=lambda r: score_of(r["experiment"].metrics))["experiment"]
+        best_exp = max(eligible, key=lambda e: score_of(e.metrics))
         best_score = score_of(best_exp.metrics)
-        current_score = -1.0
-        if self.memory.current_best and self.memory.current_best.get("metrics"):
-            current_score = score_of(self.memory.current_best["metrics"])
+        current = self.memory.current_best
+        current_score = score_of((current or {}).get("metrics")) if current else -1.0
         if best_score > current_score:
             self.memory.set_current_best(best_exp)
             return best_exp.to_dict()
-        return self.memory.current_best
+        return current
 
     def _generate_next(self, round_no, hypothesis, results):
         successes = [r for r in results if r["verdict"]["label"] == "SUCCESS"]
         promising = [r for r in results if r["verdict"]["label"] == "PROMISING"]
         suspicious = [r for r in results if r["verdict"]["label"] == "SUSPICIOUS"]
-        failed_all = all(r["verdict"]["label"] == "FAIL" for r in results)
+        fails = [r for r in results if r["verdict"]["label"] == "FAIL"]
+        # A "failed round" only steers the research direction when the failures
+        # are research-level; all-infra failures carry no research signal.
+        research_fails = [
+            r for r in fails
+            if is_research_relevant(r["verdict"].get("kind", "RESEARCH"))
+        ]
+        failed_all = bool(fails) and len(research_fails) == len(fails)
 
         if successes:
             for r in successes[:2]:

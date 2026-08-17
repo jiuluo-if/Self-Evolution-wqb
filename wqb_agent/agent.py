@@ -1,16 +1,26 @@
 import json
+import logging
 import os
 import time
 
 from .candidate import CandidateBuilder
-from .client import WQBClient
 from .discovery import FieldDiscovery
 from .diversity import deduplicate
 from .memory import ExperienceMemory
 from .reflection import Reflector
+from .scheduler import BacktestScheduler
 from .simulator import Simulator
-from .state import AlphaRecord, Experiment, ResearchState, Trajectory
+from .state import (
+    AlphaRecord,
+    Experiment,
+    ResearchState,
+    Trajectory,
+    atomic_write_json,
+    score_of,
+)
 from .validation import HighSignalValidator
+
+logger = logging.getLogger("wqb.agent")
 
 SEED_HYPOTHESES = [
     {
@@ -122,11 +132,19 @@ class Agent:
         rounds = max_rounds or self.max_rounds
         self._load_state()
         for round_no in range(1, rounds + 1):
+            # A round whose ResearchState was saved is fully finished; a crash
+            # before that point is resumed via the round's job checkpoint.
+            if os.path.exists(os.path.join(self.state_dir, f"round_{round_no}.json")):
+                logger.info("ROUND_SKIPPED round=%d reason=already-completed",
+                            round_no)
+                continue
             self.run_one_round(round_no)
 
     def run_one_round(self, round_no):
         start = time.time()
         self.discovery.reset_budget(self.discovery_budget_per_round)
+        logger.info("ROUND_STARTED round=%d sim_budget=%d validation_budget=%d",
+                    round_no, self.sim_budget_per_round, self.validation_budget)
         plan = self._plan_round(round_no)
         hypothesis = plan["hypothesis"]
         split = plan["split"]
@@ -146,6 +164,7 @@ class Agent:
                 # Fall back to previously discovered fields (cache reuse).
                 fields = self._last_fields
             if not fields:
+                logger.info("ROUND_SKIPPED round=%d reason=no-fields", round_no)
                 print("No fields discovered; skipping round.")
                 return None
             self._last_fields = fields
@@ -165,36 +184,23 @@ class Agent:
                     fields, active, split["deepen"]
                 )
 
-        budget = self.sim_budget_per_round
-        if candidates:
-            candidates = candidates[:budget]
         if not candidates:
+            logger.info("ROUND_SKIPPED round=%d reason=no-candidates", round_no)
             print("No candidates built; skipping round.")
             return None
 
-        experiments = [
-            Experiment(
-                round_no,
-                hypothesis["id"],
-                c["expression"],
-                self.simulation_settings,
-                c.get("fields_used") or [f["id"] for f in fields],
-                datasets=hypothesis.get("datasets", []),
-                lineage=c.get("lineage", []),
-            )
-            for c in candidates
-        ]
-        for c, exp in zip(candidates, experiments):
-            self._attach_candidate_meta(exp, c)
+        experiments = self._build_experiments(round_no, hypothesis, fields, candidates)
+        scheduler = self._new_scheduler(round_no)
+        scheduler.add_jobs(experiments)
+        scheduler.run()
 
-        self.simulator.run(experiments)
         for exp in experiments:
             self.trajectory.add(exp)
             self._print_experiment(exp)
 
         summary = self.reflector.reflect(round_no, hypothesis, experiments)
 
-        validation_used = self._validate_suspicious(summary, round_no)
+        validation_used = self._validate_suspicious(scheduler, summary, round_no)
         self._dedup_pool(round_no)
         self._prune_stale_lineages(round_no)
 
@@ -210,13 +216,52 @@ class Agent:
             elapsed=time.time() - start,
             validation_used=validation_used,
         )
+        logger.info(
+            "ROUND_FINISHED round=%d verdicts=%s pool=%d validation_sims=%d "
+            "elapsed=%.1fs",
+            round_no, summary["verdicts"], summary["pool_size"],
+            validation_used, time.time() - start,
+        )
         return summary
 
-    # ---- planning ----
+    # ---- experiments & scheduling ----
+
+    def _build_experiments(self, round_no, hypothesis, fields, candidates):
+        experiments = []
+        for c in candidates[: self.sim_budget_per_round]:
+            exp = Experiment(
+                round_no,
+                hypothesis["id"],
+                c["expression"],
+                self.simulation_settings,
+                c.get("fields_used") or [f["id"] for f in fields],
+                datasets=hypothesis.get("datasets", []),
+                lineage=c.get("lineage", []),
+            )
+            exp.mutation = c.get("mutation")
+            exp.rationale = c.get("rationale")
+            experiments.append(exp)
+        return experiments
+
+    def _new_scheduler(self, round_no):
+        checkpoint_path = os.path.join(self.state_dir, f"round_{round_no}_jobs.json")
+        return BacktestScheduler(
+            self.client,
+            self.simulator,
+            max_concurrent=self.max_concurrent_sims,
+            budget=self.sim_budget_per_round + self.validation_budget,
+            poll_timeout_sec=self.poll_timeout_sec,
+            checkpoint_path=checkpoint_path,
+            checkpoint_every=1,
+        )
+
+    # ---- planning (memory-driven) ----
 
     def _plan_round(self, round_no):
-        pool = self.memory.submission_pool
         n = self.candidates_per_round
+        pool = self.memory.submission_pool
+        active = self.memory.active_lineages
+
         explore = max(1, int(round(n * self.explore_ratio)))
         deepen = n - explore
         if not pool:
@@ -224,62 +269,142 @@ class Agent:
             deepen = max(0, deepen - 1)
             explore = n - deepen
 
-        # Exploration is always driven by a real hypothesis (hypothesis-first),
-        # never by a deepen pseudo-hypothesis with weak field keywords.
+        # Lineage quality: a proven lineage steers budget toward deepening.
+        if active and pool:
+            best_lineage = max(
+                (a.get("best_score", -1) for a in active), default=-1
+            )
+            if best_lineage >= self.good_fitness and deepen < n:
+                deepen += 1
+                explore = max(0, n - deepen)
+
+        hypothesis = self._choose_hypothesis(round_no)
+        return {
+            "hypothesis": hypothesis,
+            "split": {"explore": explore, "deepen": deepen},
+        }
+
+    def _choose_hypothesis(self, round_no):
         used = self._used_hypothesis_ids()
-        hypothesis = None
-        for seed in SEED_HYPOTHESES:
-            if seed["id"] not in used:
-                hypothesis = dict(seed)
-                break
-        if hypothesis is None:
-            hypothesis = dict(SEED_HYPOTHESES[round_no % len(SEED_HYPOTHESES)])
-        return {"hypothesis": hypothesis, "split": {"explore": explore, "deepen": deepen}}
+        failure_counts = self._hypothesis_failure_counts()
+        parked = self._parked_hypotheses()
+        available = [h for h in SEED_HYPOTHESES if h["id"] not in parked]
+        unused = [h for h in available if h["id"] not in used]
+        if unused:
+            candidates = unused
+        else:
+            candidates = sorted(
+                available,
+                key=lambda h: (
+                    failure_counts.get(h["id"], 0),
+                    self._last_used_round(h["id"]),
+                ),
+            )
+        if not candidates:
+            candidates = list(SEED_HYPOTHESES)
+        return dict(candidates[0])
+
+    def _parked_hypotheses(self):
+        """A hypothesis whose last two experiments both failed is parked until
+        evidence suggests revisiting it (failure history steering)."""
+        by_hypothesis = {}
+        for exp in self.trajectory.experiments:
+            by_hypothesis.setdefault(exp.hypothesis_id, []).append(exp)
+        parked = set()
+        for hid, exps in by_hypothesis.items():
+            if len(exps) >= 2 and all(e.status == "FAILED" for e in exps[-2:]):
+                parked.add(hid)
+        return parked
+
+    def _hypothesis_failure_counts(self):
+        counts = {}
+        for exp in self.trajectory.experiments:
+            if exp.status == "FAILED":
+                counts[exp.hypothesis_id] = counts.get(exp.hypothesis_id, 0) + 1
+        return counts
 
     def _used_hypothesis_ids(self):
         return {e.hypothesis_id for e in self.trajectory.experiments}
 
-    def _attach_candidate_meta(self, experiment, candidate):
-        experiment.mutation = candidate.get("mutation")
-        experiment.rationale = candidate.get("rationale")
+    def _last_used_round(self, hypothesis_id):
+        rounds = [
+            e.round
+            for e in self.trajectory.experiments
+            if e.hypothesis_id == hypothesis_id
+        ]
+        return max(rounds) if rounds else 0
 
     # ---- validation & pool maintenance ----
 
-    def _validate_suspicious(self, summary, round_no):
+    def _validate_suspicious(self, scheduler, summary, round_no):
         suspicious = summary.get("suspicious") or []
         if not suspicious:
             return 0
-        alt_fields = [f["id"] for f in self._last_fields]
-        used = 0
+        alt_fields = self._last_fields
+        validation_used = 0
         for rec in suspicious:
-            if used >= self.validation_budget:
+            if validation_used >= self.validation_budget:
                 break
-            rec_obj = AlphaRecord.from_dict(rec)
-            stable, details = self.validator.validate(rec, alt_fields=alt_fields)
-            used += len(details)
-            if stable:
-                rec_obj.status = "VALIDATED_HIGH_SIGNAL"
-                self.memory.add_alpha(rec_obj)
-                self.memory.touch_lineage(
-                    rec_obj.expression,
-                    rec_obj.lineage,
-                    rec_obj.score,
-                    round_no,
-                    fields_used=rec_obj.fields_used,
-                )
-                print(
-                    f"  [validated] {rec_obj.expression[:60]} "
-                    f"survived perturbation checks"
-                )
-            else:
-                self.memory.archive(
-                    "unreproducible_high_signal", rec_obj.expression, round_no
-                )
-                print(
-                    f"  [rejected] {rec_obj.expression[:60]} "
-                    f"unreproducible under perturbation"
-                )
-        return used
+            jobs, _ = self.validator.build_perturbation_jobs(
+                rec, alt_fields=alt_fields
+            )
+            if not jobs:
+                continue
+            take = jobs[: self.validation_budget - validation_used]
+            if not take:
+                break
+            scheduler.add_jobs(take)
+            scheduler.run()
+            validation_used += len(take)
+            results = [self._perturb_result(exp) for exp in take]
+            stable, _ = self.validator.decide(rec, results)
+            self._apply_validation(rec, stable, round_no, len(take))
+        return validation_used
+
+    def _apply_validation(self, rec, stable, round_no, sims):
+        rec_obj = AlphaRecord.from_dict(rec)
+        if stable:
+            rec_obj.status = AlphaRecord.STATUS_VALIDATED
+            self.memory.add_alpha(rec_obj)
+            self.memory.touch_lineage(
+                rec_obj.expression,
+                rec_obj.lineage,
+                rec_obj.score,
+                round_no,
+                fields_used=rec_obj.fields_used,
+            )
+            logger.info(
+                "VALIDATION_FINISHED round=%d expression=%s stable=True sims=%d",
+                round_no, rec_obj.expression[:60], sims,
+            )
+            print(
+                f"  [validated] {rec_obj.expression[:60]} "
+                f"survived perturbation checks"
+            )
+        else:
+            self.memory.archive(
+                "unreproducible_high_signal", rec_obj.expression, round_no
+            )
+            logger.info(
+                "VALIDATION_FINISHED round=%d expression=%s stable=False sims=%d",
+                round_no, rec_obj.expression[:60], sims,
+            )
+            print(
+                f"  [rejected] {rec_obj.expression[:60]} "
+                f"unreproducible under perturbation"
+            )
+
+    @staticmethod
+    def _perturb_result(exp):
+        metrics = exp.metrics or {}
+        return {
+            "expression": exp.expression,
+            "score": score_of(metrics) if metrics else -1.0,
+            "sharpe": metrics.get("sharpe"),
+            "turnover": metrics.get("turnover"),
+            "checks_passed": metrics.get("passed") is True,
+            "error": exp.error,
+        }
 
     def _dedup_pool(self, round_no):
         if len(self.memory.submission_pool) < 2:
@@ -353,9 +478,11 @@ class Agent:
 
     def _save_state(self, state):
         os.makedirs(self.state_dir, exist_ok=True)
-        traj_path = os.path.join(self.state_dir, "trajectory.json")
-        with open(traj_path, "w") as f:
-            json.dump(self.trajectory.to_dict(), f, indent=2)
-        state_path = os.path.join(self.state_dir, f"round_{state.round_no}.json")
-        with open(state_path, "w") as f:
-            json.dump(state.to_dict(), f, indent=2)
+        atomic_write_json(
+            os.path.join(self.state_dir, "trajectory.json"),
+            self.trajectory.to_dict(),
+        )
+        atomic_write_json(
+            os.path.join(self.state_dir, f"round_{state.round_no}.json"),
+            state.to_dict(),
+        )

@@ -1,5 +1,21 @@
+import json
+import os
 import time
 import uuid
+
+
+def atomic_write_json(path, data):
+    """Write JSON atomically via tmp + os.replace()."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, default=_json_default)
+    os.replace(tmp, path)
+
+
+def _json_default(obj):
+    if isinstance(obj, set):
+        return list(obj)
+    return str(obj)
 
 
 def score_of(metrics):
@@ -151,12 +167,21 @@ class AlphaRecord:
 
 
 class Trajectory:
+    SCHEMA_VERSION = 1
+
     def __init__(self, max_len=100):
         self.experiments = []
         self.max_len = max_len
+        self.created_at = time.time()
+        self.updated_at = time.time()
 
     def add(self, experiment):
+        # Idempotent: a job restored from a scheduler checkpoint must not be
+        # recorded twice.
+        if any(e.id == experiment.id for e in self.experiments):
+            return
         self.experiments.append(experiment)
+        self.updated_at = time.time()
         if len(self.experiments) > self.max_len:
             self.experiments = self.experiments[-self.max_len:]
 
@@ -167,7 +192,12 @@ class Trajectory:
         return [e for e in self.experiments if e.metrics is not None]
 
     def to_dict(self):
-        return {"experiments": [e.to_dict() for e in self.experiments]}
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "experiments": [e.to_dict() for e in self.experiments],
+        }
 
     @classmethod
     def from_dict(cls, data, max_len=100):
@@ -175,22 +205,29 @@ class Trajectory:
         traj.experiments = [
             Experiment.from_dict(e) for e in data.get("experiments", [])
         ]
+        traj.created_at = data.get("created_at", traj.created_at)
+        traj.updated_at = data.get("updated_at", traj.updated_at)
         return traj
 
 
 class ResearchState:
+    SCHEMA_VERSION = 1
+
     def __init__(self, round_no=0, hypothesis=None, dataset=None, fields_used=None):
         self.round_no = round_no
         self.hypothesis = hypothesis
         self.dataset = dataset
         self.fields_used = fields_used or []
-        self.started_at = time.time()
+        self.created_at = time.time()
+        self.updated_at = time.time()
 
     def to_dict(self):
         return {
+            "schema_version": self.SCHEMA_VERSION,
             "round_no": self.round_no,
             "hypothesis": self.hypothesis,
             "dataset": self.dataset,
             "fields_used": self.fields_used,
-            "started_at": self.started_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }

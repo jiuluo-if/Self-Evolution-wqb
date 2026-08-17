@@ -1,4 +1,7 @@
+import logging
 import re
+
+logger = logging.getLogger("wqb.discovery")
 
 DATASET_CATEGORIES = {
     "analyst": ["analyst4"],
@@ -176,7 +179,15 @@ class FieldDiscovery:
                         need=target_count - len(chosen),
                         seen=seen,
                     )
-                except Exception:
+                except Exception as exc:  # noqa: BLE001
+                    # Never silently swallow field-discovery errors: log them so
+                    # repeated failures are visible and diagnosable.
+                    logger.warning(
+                        "FIELD_DISCOVERY_FAILED dataset=%s error=%s:%s",
+                        dataset_id,
+                        type(exc).__name__,
+                        exc,
+                    )
                     continue
                 for score, field in ranked:
                     if len(chosen) >= target_count:

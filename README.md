@@ -62,29 +62,32 @@ python main.py --state-dir /tmp/wqb  # 指定状态目录
 
 | 模块 | 职责 |
 |------|------|
-| `wqb_agent/client.py` | WQB API：认证、datasets/datafields 分页、simulate、Retry-After 轮询、alpha 指标 |
+| `wqb_agent/client.py` | WQB API：统一 retry（401→重新认证、429→Retry-After、5xx/超时→指数退避+抖动、400/403/404/422→快速失败）、thread-local Session、poll 快速失败 |
+| `wqb_agent/failures.py` | 失败分类：RESEARCH / SYNTAX / DATA / INFRA / AUTH / RATE_LIMIT / TIMEOUT；仅研究相关失败进入研究记忆 |
 | `wqb_agent/discovery.py` | 按 Hypothesis 选 dataset，分页检索字段；运行期页缓存 + 每轮 API 预算 |
-| `wqb_agent/candidate.py` | 探索池 + 深化池双池构造，深化按 lineage 做单变量局部优化 |
-| `wqb_agent/diversity.py` | 字段/表达式/假设相似度、冗余判定、提交池去重 |
-| `wqb_agent/validation.py` | 异常高信号扰动验证（SUSPICIOUS_HIGH_SIGNAL → VALIDATED_HIGH_SIGNAL） |
-| `wqb_agent/simulator.py` | 并发模拟（默认最多 3 个同时跑） |
-| `wqb_agent/reflection.py` | Good/PROMISING/FAIL/SUSPICIOUS 分类、lineage 更新、提交池维护、三层记忆沉淀 |
-| `wqb_agent/memory.py` | 三层记忆：short-term（next/active lineages）、long-term（多次验证的经验）、garbage（重复失败/过时/不可复现） |
-| `wqb_agent/agent.py` | 主循环编排（探索/深化规划、预算、验证、去重、下一轮计划） |
-| `wqb_agent/state.py` | ResearchState / Experiment / Trajectory / AlphaRecord 数据模型 |
+| `wqb_agent/candidate.py` | 探索池 + 深化池双池构造；探索按假设类型选 operator family（reversal/momentum/revision/cross-sectional/relationship）；深化做单变量局部优化（window step / smoothing / neutralize / 语义受限 field swap） |
+| `wqb_agent/diversity.py` | 字段/表达式/假设相似度、冗余判定、提交池去重、表达式实际用到的字段提取 |
+| `wqb_agent/scheduler.py` | BacktestScheduler：execution group、最大并发、simulation budget、FIRST_COMPLETED 滑动窗口补任务、pending/started/completed/failed、checkpoint + crash resume（tmp + os.replace 原子写入） |
+| `wqb_agent/simulator.py` | 只负责单次 submit → poll → fetch metrics |
+| `wqb_agent/validation.py` | 异常高信号扰动验证：多数扰动通过 + median fitness + 相对原始 Alpha 的 performance retention + WQB checks |
+| `wqb_agent/reflection.py` | Good/PROMISING/FAIL/SUSPICIOUS 分类、failure taxonomy、lineage 更新、提交池维护、三层记忆沉淀 |
+| `wqb_agent/memory.py` | 三层记忆：short-term（next/active lineages）、long-term（跨多轮独立证据）、garbage（重复失败/过时/不可复现）；evidence 记录真实实验来源 |
+| `wqb_agent/agent.py` | 主循环编排（memory-driven planning、预算、验证、去重、下一轮计划） |
+| `wqb_agent/state.py` | ResearchState / Experiment / Trajectory / AlphaRecord 数据模型 + 原子写 JSON |
 
 ## 状态文件（`.wqb_state/`）
 
-- `experience.json` — 三层记忆 + current_best + submission_pool + active_lineages
+- `experience.json` — 三层记忆 + current_best + submission_pool + active_lineages（含 schema_version / created_at / updated_at）
 - `trajectory.json` — 实验轨迹（含 lineage）
 - `round_N.json` — 每轮 ResearchState
+- `round_N_jobs.json` — 每轮回测 checkpoint，崩溃后自动恢复，已完成的 job 不重复执行
 
 ## 三层记忆
 
 | 层级 | 内容 | 维护 |
 |------|------|------|
 | Short-term | next 计划、active lineage、低证据 lesson | 每轮压缩，过期归档到 garbage |
-| Long-term | evidence ≥ 3 的经验、稳定失败模式、成熟 lineage | 保留 top-N |
+| Long-term | evidence 累计 ≥ 3 且来自多个独立 round 的经验、稳定失败模式、成熟 lineage | 保留 top-N |
 | Garbage | 重复失败、过时经验、不可复现高信号、冗余去重 | 容量封顶，默认不进上下文 |
 
 ## 测试

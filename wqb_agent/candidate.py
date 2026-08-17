@@ -1,5 +1,7 @@
 import re
 
+from .diversity import extract_fields
+
 WINDOW_STEPS = [5, 10, 20, 60]
 
 _TS_OP_RE = re.compile(
@@ -44,6 +46,84 @@ def _swap_field(expression, old_field, new_field):
     return swapped
 
 
+# ---- hypothesis-driven operator families ----
+#
+# A candidate is built from the hypothesis, never from a generic bag of
+# operators. Each hypothesis type maps to a small family of operators that
+# encode its economic content.
+
+_REVERSAL_TEMPLATES = [
+    "-rank({p})",
+    "-ts_rank({p}, 20)",
+    "-rank(ts_zscore({p}, 20))",
+    "-rank(ts_mean({p}, 5))",
+    "group_neutralize(-rank({p}), {g})",
+    "-rank(ts_rank({p}, 5))",
+]
+
+_MOMENTUM_TEMPLATES = [
+    "rank(ts_mean({p}, 20))",
+    "rank(ts_rank({p}, 20))",
+    "rank(ts_sum({p}, 20))",
+    "rank(ts_mean(ts_rank({p}, 5), 20))",
+    "group_neutralize(rank(ts_mean({p}, 20)), {g})",
+    "rank(ts_rank({p}, 60))",
+]
+
+_REVISION_TEMPLATES = [
+    "rank(ts_delta({p}, 5))",
+    "-rank(ts_delta({p}, 5))",
+    "rank(ts_mean(ts_delta({p}, 5), 5))",
+    "group_neutralize(rank(ts_delta({p}, 5)), {g})",
+    "rank(ts_delta({p}, 10))",
+]
+
+_CROSS_SECTIONAL_TEMPLATES = [
+    "rank({p})",
+    "zscore({p})",
+    "group_neutralize(rank({p}), {g})",
+    "rank(ts_rank({p}, 20))",
+    "-rank({p})",
+    "group_neutralize(zscore({p}), {g})",
+]
+
+_RELATIONSHIP_TEMPLATES = [
+    "rank(ts_corr({p}, {s}, 20))",
+    "rank(ts_corr({p}, {s}, 60))",
+    "zscore(ts_delta({p}, 5)) - zscore(ts_delta({s}, 5))",
+    "rank({p} - {s})",
+    "group_neutralize(rank(ts_corr({p}, {s}, 20)), {g})",
+]
+
+
+def _family_for(hypothesis):
+    tags = {t.lower() for t in (hypothesis.get("tags") or [])}
+    direction = hypothesis.get("direction")
+    if direction == "reversal":
+        return "reversal"
+    if tags & {"momentum", "trend", "continuation"}:
+        return "momentum"
+    if tags & {"revision", "estimate", "forecast", "revision-upward"}:
+        return "revision"
+    if tags & {"relationship", "corr", "correlation", "ratio", "spread",
+               "cross", "pair"}:
+        return "relationship"
+    return "cross_sectional"
+
+
+def _templates_for(hypothesis):
+    family = _family_for(hypothesis)
+    if family == "reversal":
+        return _REVERSAL_TEMPLATES
+    if family == "momentum":
+        return _MOMENTUM_TEMPLATES
+    if family == "revision":
+        return _REVISION_TEMPLATES
+    if family == "relationship":
+        return _RELATIONSHIP_TEMPLATES
+    return _CROSS_SECTIONAL_TEMPLATES
+
+
 class CandidateBuilder:
     """Builds candidates in two pools:
 
@@ -83,38 +163,28 @@ class CandidateBuilder:
         if not primary:
             return []
         secondary = fields[1]["id"] if len(fields) > 1 else None
-        reversal = hypothesis.get("direction") == "reversal"
-        sign = "-" if reversal else ""
         g = self.neutralization
+        all_ids = [f["id"] if isinstance(f, dict) else f for f in fields]
 
-        templates = [
-            f"{sign}rank({primary})",
-            f"rank(ts_rank({primary}, 20))",
-            f"{sign}rank(ts_mean({primary}, 5))",
-            f"{sign}rank(ts_delta({primary}, 5))",
-            f"group_neutralize({sign}rank({primary}), {g})",
-            f"{sign}zscore({primary})",
-            f"rank(ts_zscore({primary}, 20))",
-            f"rank(ts_std_dev({primary}, 20))",
-            f"-ts_delta(rank({primary}), 5)",
-        ]
-        if secondary:
-            templates.append(f"{sign}rank(ts_corr({primary}, {secondary}, 20))")
-
+        templates = _templates_for(hypothesis)
         candidates = []
         seen = set()
         for t in templates:
-            if t in seen:
+            filled = t.format(p=primary, s=secondary or primary, g=g)
+            if filled in seen:
                 continue
-            seen.add(t)
+            seen.add(filled)
             candidates.append(
                 {
-                    "expression": t,
-                    "rationale": f"Exploration on {primary}.",
+                    "expression": filled,
+                    "rationale": (
+                        f"Exploration on {primary} via "
+                        f"{_family_for(hypothesis)} family."
+                    ),
                     "mutation": "explore",
                     "parent": None,
                     "lineage": [],
-                    "fields_used": [f["id"] for f in fields],
+                    "fields_used": extract_fields(filled, all_ids),
                 }
             )
             if len(candidates) >= count:
@@ -137,7 +207,12 @@ class CandidateBuilder:
                     list(alpha.get("fields_used") or []) + self._field_ids(fields)
                 )
             )
-            for cand in self._mutations(expr, alpha.get("lineage") or [], alpha_fields):
+            field_meta = {
+                f["id"]: f for f in fields if isinstance(f, dict) and f.get("id")
+            }
+            for cand in self._mutations(
+                expr, alpha.get("lineage") or [], alpha_fields, field_meta
+            ):
                 if cand["expression"] in seen:
                     continue
                 seen.add(cand["expression"])
@@ -146,26 +221,35 @@ class CandidateBuilder:
                     return candidates
         return candidates
 
-    def _mutations(self, expr, lineage, field_ids):
-        """Single-variable, single-parameter mutations of an existing alpha."""
+    def _mutations(self, expr, lineage, field_ids, field_meta):
+        """Single-variable, single-parameter mutations of an existing alpha.
+
+        field swap is restricted to a semantically-close field (same dataset,
+        then same category, then expression-internal secondary, then any known
+        field) so unrelated fields are not swapped in.
+        """
         primary = self._primary_field(expr, field_ids)
-        secondary = self._secondary_field(expr, field_ids)
         g = self.neutralization
         mutations = []
 
-        if primary and secondary:
-            swapped = _swap_field(expr, primary, secondary)
-            if swapped:
-                mutations.append(
-                    {
-                        "expression": swapped,
-                        "rationale": f"Single-variable field swap: {primary} -> {secondary}.",
-                        "mutation": "field-swap",
-                        "parent": expr,
-                        "lineage": [expr] + lineage,
-                        "fields_used": list(field_ids),
-                    }
-                )
+        if primary:
+            alt = self._semantic_alt_field(expr, primary, field_ids, field_meta)
+            if alt:
+                swapped = _swap_field(expr, primary, alt)
+                if swapped:
+                    mutations.append(
+                        {
+                            "expression": swapped,
+                            "rationale": (
+                                f"Single-variable field swap: {primary} -> {alt} "
+                                f"(semantically related)."
+                            ),
+                            "mutation": "field-swap",
+                            "parent": expr,
+                            "lineage": [expr] + lineage,
+                            "fields_used": extract_fields(swapped, field_ids),
+                        }
+                    )
 
         up = _window_change(expr, +1)
         if up:
@@ -176,7 +260,7 @@ class CandidateBuilder:
                     "mutation": "window-up",
                     "parent": expr,
                     "lineage": [expr] + lineage,
-                    "fields_used": list(field_ids),
+                    "fields_used": extract_fields(up, field_ids),
                 }
             )
 
@@ -189,7 +273,7 @@ class CandidateBuilder:
                     "mutation": "window-down",
                     "parent": expr,
                     "lineage": [expr] + lineage,
-                    "fields_used": list(field_ids),
+                    "fields_used": extract_fields(down, field_ids),
                 }
             )
 
@@ -202,7 +286,7 @@ class CandidateBuilder:
                     "mutation": "smooth-ts-mean-5",
                     "parent": expr,
                     "lineage": [expr] + lineage,
-                    "fields_used": list(field_ids),
+                    "fields_used": extract_fields(smooth, field_ids),
                 }
             )
 
@@ -215,11 +299,40 @@ class CandidateBuilder:
                     "mutation": f"neutralize-{g}",
                     "parent": expr,
                     "lineage": [expr] + lineage,
-                    "fields_used": list(field_ids),
+                    "fields_used": extract_fields(neutralized, field_ids),
                 }
             )
 
         return mutations
+
+    @staticmethod
+    def _semantic_alt_field(expr, primary, field_ids, field_meta):
+        """Pick a semantically-close replacement for the primary field."""
+        meta = field_meta.get(primary)
+        if meta:
+            same_ds = [
+                f
+                for f in field_ids
+                if f != primary
+                and field_meta.get(f)
+                and field_meta[f].get("dataset") == meta.get("dataset")
+            ]
+            if same_ds:
+                return same_ds[0]
+            same_cat = [
+                f
+                for f in field_ids
+                if f != primary
+                and field_meta.get(f)
+                and field_meta[f].get("category") == meta.get("category")
+            ]
+            if same_cat:
+                return same_cat[0]
+        secondary = CandidateBuilder._secondary_field(expr, field_ids)
+        if secondary:
+            return secondary
+        others = [f for f in field_ids if f != primary]
+        return others[0] if others else None
 
     @staticmethod
     def _field_ids(fields):

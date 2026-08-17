@@ -562,7 +562,9 @@ class TestAgentLoop(unittest.TestCase):
             os.path.exists(os.path.join(tmpdir, "trajectory.json"))
         )
         round_files = [
-            f for f in os.listdir(tmpdir) if f.startswith("round_")
+            f
+            for f in os.listdir(tmpdir)
+            if f.startswith("round_") and f.endswith(".json") and "_jobs" not in f
         ]
         self.assertEqual(len(round_files), 2)
         with open(os.path.join(tmpdir, "experience.json")) as f:

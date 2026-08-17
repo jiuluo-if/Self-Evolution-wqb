@@ -5,6 +5,25 @@ import re
 
 _FIELD_RE = re.compile(r"[a-z0-9_]+")
 
+_WORD_BOUNDARY_RE = re.compile(r"(?<![\w])")
+
+
+def extract_fields(expression, known_fields):
+    """Return the subset of known_fields that actually appear in the expression.
+
+    Matches longest ids first so that a field id which is a prefix of another
+    (e.g. ``returns`` vs ``returns_5d``) does not cause a false positive.
+    """
+    expression = expression or ""
+    found = []
+    for fid in sorted(dict.fromkeys(known_fields or []), key=len, reverse=True):
+        if not fid:
+            continue
+        pattern = _WORD_BOUNDARY_RE.pattern + re.escape(fid) + r"(?![\w])"
+        if re.search(pattern, expression):
+            found.append(fid)
+    return found
+
 
 def expression_tokens(expr):
     """Tokenize an expression into operators, field names and numbers."""

@@ -1,9 +1,16 @@
 import argparse
 import json
+import logging
 import os
 import sys
 
 from wqb_agent import Agent, WQBClient
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("wqb.main")
 
 
 def load_config(path):
