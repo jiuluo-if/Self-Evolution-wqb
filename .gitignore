@@ -10,6 +10,9 @@ wqb_credentials.json
 
 # Runtime state (experience memory, trajectory, research states)
 .wqb_state/
+
+# Local agent memory
+.monkeycode/
 state/
 reports/
 output/
