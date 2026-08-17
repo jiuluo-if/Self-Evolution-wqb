@@ -19,6 +19,15 @@
     "pagination_limit": 50,
     "max_pagination_pages": 20,
     "state_dir": ".wqb_state",
-    "poll_timeout_sec": 900
+    "poll_timeout_sec": 900,
+    "explore_ratio": 0.5,
+    "good_sharpe": 1.0,
+    "good_fitness": 1.0,
+    "high_signal_sharpe": 2.5,
+    "high_signal_fitness": 2.0,
+    "max_deepen_per_lineage": 3,
+    "sim_budget_per_round": 10,
+    "validation_budget_per_round": 4,
+    "discovery_budget_per_round": 8
   }
 }

@@ -51,11 +51,37 @@ CATEGORY_KEYWORDS = {
 }
 
 
+class BudgetExhausted(Exception):
+    pass
+
+
 class FieldDiscovery:
     def __init__(self, client, pagination_limit=50, max_pages=20):
         self.client = client
         self.pagination_limit = pagination_limit
         self.max_pages = max_pages
+        self._cache = {}  # (dataset_id, limit, offset) -> cached page payload
+        self._budget = None
+        self._calls = 0
+
+    def reset_budget(self, budget):
+        """Per-round cap on new field-discovery API requests (0 = unlimited)."""
+        self._budget = budget
+        self._calls = 0
+
+    def _page(self, dataset_id, limit, offset):
+        key = (dataset_id, limit, offset)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached["results"], cached["count"]
+        if self._budget is not None and self._calls >= self._budget:
+            raise BudgetExhausted()
+        results, count = self.client.get_datafields(
+            dataset_id, limit=limit, offset=offset
+        )
+        self._calls += 1
+        self._cache[key] = {"results": results, "count": count}
+        return results, count
 
     def categorize_hypothesis(self, hypothesis):
         text = hypothesis.get("statement", "")
@@ -77,9 +103,12 @@ class FieldDiscovery:
         offset = 0
         total = None
         for _ in range(self.max_pages):
-            results, count = self.client.get_datafields(
-                dataset_id, limit=self.pagination_limit, offset=offset
-            )
+            try:
+                results, count = self._page(
+                    dataset_id, limit=self.pagination_limit, offset=offset
+                )
+            except BudgetExhausted:
+                break
             total = count
             for field in results:
                 if field.get("id") in seen:
