@@ -3,6 +3,7 @@ import logging
 import os
 import time
 
+from .beliefs import belief_claim, belief_identity
 from .candidate import CandidateBuilder
 from .discovery import FieldDiscovery
 from .diversity import deduplicate
@@ -426,16 +427,28 @@ class Agent:
             )
 
     @staticmethod
-    def _belief_key_of(rec):
-        fields = sorted(rec.get("fields_used") or [])
-        label = ",".join(fields) if fields else "unknown"
-        return f"fields:{label}"
+    def _hypothesis_of(hypothesis_id):
+        """Look up the hypothesis dict by id for belief derivation. Only the
+        id is looked up here; the belief key itself is built by the single
+        canonical helper in `beliefs.py`, shared with the Reflector."""
+        for h in SEED_HYPOTHESES:
+            if h["id"] == hypothesis_id:
+                return h
+        return None
 
-    @staticmethod
-    def _belief_claim_of(rec):
-        fields = rec.get("fields_used") or []
-        field_label = ",".join(fields) if fields else "?"
-        return f"Fields [{field_label}] carry predictive signal for forward returns"
+    def _belief_key_of(self, rec):
+        return belief_identity(
+            rec.get("hypothesis_id"),
+            rec.get("fields_used"),
+            hypothesis=self._hypothesis_of(rec.get("hypothesis_id")),
+        )
+
+    def _belief_claim_of(self, rec):
+        return belief_claim(
+            rec.get("hypothesis_id"),
+            rec.get("fields_used"),
+            hypothesis=self._hypothesis_of(rec.get("hypothesis_id")),
+        )
 
     @staticmethod
     def _validation_source(rec, round_no):

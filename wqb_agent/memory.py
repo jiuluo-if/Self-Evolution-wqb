@@ -342,27 +342,6 @@ class ExperienceMemory:
             return "long"
         return "short"
 
-    def add_avoid(self, direction, reason, source_round, source=None):
-        for item in self.avoid:
-            if item["direction"] == direction:
-                item["reason"] = reason
-                item["source_round"] = source_round
-                item["updated"] = time.time()
-                if source:
-                    item["evidence_log"] = [dict(source)]
-                return item
-        entry = {
-            "id": uuid.uuid4().hex[:8],
-            "direction": direction,
-            "reason": reason,
-            "source_round": source_round,
-            "evidence_log": [dict(source)] if source else [],
-            "created": time.time(),
-            "updated": time.time(),
-        }
-        self.avoid.append(entry)
-        return entry
-
     def add_next(self, idea, priority, source, round_no):
         for item in self.next:
             if item["idea"] == idea:

@@ -1,3 +1,4 @@
+from .beliefs import belief_claim, belief_identity
 from .diversity import is_redundant
 from .failures import FailureKind, classify_error, is_research_relevant
 from .state import AlphaRecord, score_of
@@ -178,8 +179,10 @@ class Reflector:
                     "repeat_fail", self._direction_key(exp), round_no
                 )
             self.memory.record_evidence(
-                self._belief_key(exp),
-                self._belief_claim(exp),
+                belief_identity(exp.hypothesis_id, exp.fields_used,
+                                  hypothesis=hypothesis),
+                belief_claim(exp.hypothesis_id, exp.fields_used,
+                             hypothesis=hypothesis),
                 "contradict",
                 round_no,
                 source=self._source_of(exp),
@@ -201,8 +204,10 @@ class Reflector:
                 source=self._source_of(exp),
             )
             self.memory.record_evidence(
-                self._belief_key(exp),
-                self._belief_claim(exp),
+                belief_identity(exp.hypothesis_id, exp.fields_used,
+                                  hypothesis=hypothesis),
+                belief_claim(exp.hypothesis_id, exp.fields_used,
+                             hypothesis=hypothesis),
                 "support",
                 round_no,
                 source=self._source_of(exp),
@@ -221,8 +226,10 @@ class Reflector:
             # counts once robustness validation confirms it (or becomes a
             # contradiction when validation rejects it).
             self.memory.record_evidence(
-                self._belief_key(exp),
-                self._belief_claim(exp),
+                belief_identity(exp.hypothesis_id, exp.fields_used,
+                                  hypothesis=hypothesis),
+                belief_claim(exp.hypothesis_id, exp.fields_used,
+                             hypothesis=hypothesis),
                 "pending",
                 round_no,
                 source=self._source_of(exp),
@@ -237,8 +244,10 @@ class Reflector:
                 source=self._source_of(exp),
             )
             self.memory.record_evidence(
-                self._belief_key(exp),
-                self._belief_claim(exp),
+                belief_identity(exp.hypothesis_id, exp.fields_used,
+                                  hypothesis=hypothesis),
+                belief_claim(exp.hypothesis_id, exp.fields_used,
+                             hypothesis=hypothesis),
                 "support",
                 round_no,
                 source=self._source_of(exp),
@@ -261,8 +270,10 @@ class Reflector:
             # belief on these fields. Not a lesson to be text-merged with
             # successes (token similarity cannot decide polarity).
             self.memory.record_evidence(
-                self._belief_key(exp),
-                self._belief_claim(exp),
+                belief_identity(exp.hypothesis_id, exp.fields_used,
+                                  hypothesis=hypothesis),
+                belief_claim(exp.hypothesis_id, exp.fields_used,
+                             hypothesis=hypothesis),
                 "contradict",
                 round_no,
                 source=self._source_of(exp),
@@ -343,20 +354,6 @@ class Reflector:
     @staticmethod
     def _direction_key(exp):
         return exp.expression[:80]
-
-    @staticmethod
-    def _belief_key(exp):
-        """Explicit identity for a research belief (field-family). Polarity is
-        decided by the outcome, never by text similarity between claims."""
-        fields = sorted(exp.fields_used)
-        label = ",".join(fields) if fields else "unknown"
-        return f"fields:{label}"
-
-    @staticmethod
-    def _belief_claim(exp):
-        fields = exp.fields_used
-        field_label = ",".join(fields) if fields else "?"
-        return f"Fields [{field_label}] carry predictive signal for forward returns"
 
     def _update_best(self, results):
         """Best may only come from experiments that fully passed WQB checks and
