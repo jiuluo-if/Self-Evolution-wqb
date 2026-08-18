@@ -1,6 +1,8 @@
 import logging
 import re
 
+from .hypothesis import ContractViolation, has_field_semantics
+
 logger = logging.getLogger("wqb.discovery")
 
 DATASET_CATEGORIES = {
@@ -159,9 +161,26 @@ class FieldDiscovery:
         ):
             if piece:
                 push(piece)
+        # The hypothesis contract says WHAT economic meaning a field must
+        # have; those concept/description words join the search vocabulary so
+        # Discovery picks the real field whose meaning matches best.
+        semantics = (hypothesis.get("field_semantics") or {}).get("primary")
+        if semantics:
+            for text in (
+                str(semantics.get("concept") or ""),
+                str(semantics.get("description") or ""),
+            ):
+                for piece in re.split(r"[^a-z0-9]+", text.lower()):
+                    if piece:
+                        push(piece)
         return ordered[:limit]
 
-    def discover(self, hypothesis, target_count=6):
+    def discover(self, hypothesis, target_count=6, require_field_semantics=False):
+        if require_field_semantics and not has_field_semantics(hypothesis):
+            raise ContractViolation(
+                "field_semantics missing; Field Discovery is not allowed "
+                "for a hypothesis without a research contract"
+            )
         categories = self.categorize_hypothesis(hypothesis)
         keywords = self._keywords_from_hypothesis(hypothesis)
         chosen = []

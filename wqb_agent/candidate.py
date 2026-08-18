@@ -153,7 +153,9 @@ class CandidateBuilder:
             return self.build_explore(hypothesis, fields, total)
         explore_count = max(1, int(round(total * explore_ratio)))
         explore = self.build_explore(hypothesis, fields, explore_count)
-        deepen = self.build_deepen(fields, deepenable, total - len(explore))
+        deepen = self.build_deepen(
+            fields, deepenable, total - len(explore), hypothesis=hypothesis
+        )
         return explore + deepen
 
     # ---- exploration pool ----
@@ -167,6 +169,20 @@ class CandidateBuilder:
         all_ids = [f["id"] if isinstance(f, dict) else f for f in fields]
 
         templates = _templates_for(hypothesis)
+        family = _family_for(hypothesis)
+        mechanism = hypothesis.get("expected_mechanism")
+        expected_dir = hypothesis.get("expected_direction")
+        sign = (expected_dir or {}).get("sign")
+        horizon = hypothesis.get("expected_horizon_days")
+        semantic = (hypothesis.get("field_semantics") or {}).get("primary")
+        research_question = (
+            hypothesis.get("research_question")
+            or hypothesis.get("statement", "")
+            or (
+                f"Does {primary} in direction {sign or 'the hypothesis direction'} "
+                "predict forward returns?"
+            )
+        )
         candidates = []
         seen = set()
         for t in templates:
@@ -177,12 +193,18 @@ class CandidateBuilder:
             candidates.append(
                 {
                     "expression": filled,
-                    "rationale": (
-                        f"Exploration on {primary} via "
-                        f"{_family_for(hypothesis)} family."
+                    "rationale": self._explore_rationale(
+                        hypothesis, primary, filled, family, sign, horizon
                     ),
-                    "research_question": hypothesis.get("statement", ""),
+                    "research_question": research_question,
                     "hypothesis_id": hypothesis.get("id"),
+                    "mechanism": mechanism,
+                    "field_semantic": semantic,
+                    "expected_direction": expected_dir,
+                    "expected_horizon_days": horizon,
+                    "falsification_variant": self._is_falsification(
+                        family, sign
+                    ),
                     "mutation": "explore",
                     "parent": None,
                     "lineage": [],
@@ -193,11 +215,37 @@ class CandidateBuilder:
                 break
         return candidates
 
+    @staticmethod
+    def _explore_rationale(hypothesis, primary, template, family, sign, horizon):
+        """Why this field, this operator, this direction, this window."""
+        parts = [f"Exploration on {primary} via {family} family"]
+        mechanism = hypothesis.get("expected_mechanism")
+        if mechanism:
+            parts.append(f"testing mechanism: {mechanism}")
+        if sign:
+            parts.append(f"expected direction: {sign}")
+        if horizon:
+            parts.append(f"horizon prior: {horizon}d")
+        return "; ".join(parts) + "."
+
+    @staticmethod
+    def _is_falsification(family, sign):
+        """A template whose sign contradicts the hypothesis's expected sign is
+        an explicit falsification probe, never a silent direction flip."""
+        if family == "reversal":
+            return sign is not None and sign != "negative"
+        if family == "momentum":
+            return sign is not None and sign != "positive"
+        # Mixed-sign families (revision / cross-sectional / relationship)
+        # cannot be judged template-by-template.
+        return False
+
     # ---- deepening pool ----
 
-    def build_deepen(self, fields, active_alphas, count):
+    def build_deepen(self, fields, active_alphas, count, hypothesis=None):
         candidates = []
         seen = set()
+        ctx = self._deepen_context(hypothesis)
         for alpha in active_alphas:
             expr = alpha.get("expression") or ""
             if not expr:
@@ -213,7 +261,7 @@ class CandidateBuilder:
                 f["id"]: f for f in fields if isinstance(f, dict) and f.get("id")
             }
             for cand in self._mutations(
-                expr, alpha.get("lineage") or [], alpha_fields, field_meta
+                expr, alpha.get("lineage") or [], alpha_fields, field_meta, ctx
             ):
                 if cand["expression"] in seen:
                     continue
@@ -223,19 +271,46 @@ class CandidateBuilder:
                     return candidates
         return candidates
 
-    def _mutations(self, expr, lineage, field_ids, field_meta):
+    @staticmethod
+    def _deepen_context(hypothesis):
+        mechanism = (hypothesis or {}).get("expected_mechanism")
+        return {
+            "mechanism": mechanism,
+            "mechanism_clause": mechanism or "the hypothesized effect",
+            "hypothesis_id": (hypothesis or {}).get("id"),
+            "expected_direction": (hypothesis or {}).get("expected_direction"),
+            "expected_horizon_days": (hypothesis or {}).get(
+                "expected_horizon_days"
+            ),
+            "field_semantic": (
+                ((hypothesis or {}).get("field_semantics") or {}).get("primary")
+            ),
+        }
+
+    def _mutations(self, expr, lineage, field_ids, field_meta, ctx=None):
         """Single-variable, single-parameter mutations of an existing alpha.
 
         field swap is restricted to a semantically-close field (same dataset,
         then same category, then expression-internal secondary, then any known
-        field) so unrelated fields are not swapped in.
+        field) so unrelated fields are not swapped in. Each mutation changes
+        exactly one thing and carries a research question that names the
+        mechanism being probed.
         """
+        ctx = ctx or self._deepen_context(None)
         primary = self._primary_field(expr, field_ids)
         g = self.neutralization
         mutations = []
-        question = (
-            lambda m: f"Does a single {m} on {expr} improve lineage performance?"
-        )
+        mechanism = ctx["mechanism_clause"]
+
+        def stamp(cand, mutation):
+            cand["hypothesis_id"] = ctx["hypothesis_id"]
+            cand["mechanism"] = ctx["mechanism"]
+            cand["field_semantic"] = ctx["field_semantic"]
+            cand["expected_direction"] = ctx["expected_direction"]
+            cand["expected_horizon_days"] = ctx["expected_horizon_days"]
+            cand["falsification_variant"] = False
+            cand["mutation"] = mutation
+            return cand
 
         if primary:
             alt = self._semantic_alt_field(expr, primary, field_ids, field_meta)
@@ -243,77 +318,112 @@ class CandidateBuilder:
                 swapped = _swap_field(expr, primary, alt)
                 if swapped:
                     mutations.append(
-                        {
-                            "expression": swapped,
-                            "rationale": (
-                                f"Single-variable field swap: {primary} -> {alt} "
-                                f"(semantically related)."
-                            ),
-                            "research_question": question("field swap"),
-                            "mutation": "field-swap",
-                            "parent": expr,
-                            "lineage": [expr] + lineage,
-                            "fields_used": extract_fields(swapped, field_ids),
-                        }
+                        stamp(
+                            {
+                                "expression": swapped,
+                                "rationale": (
+                                    f"Single-variable field swap: {primary} -> {alt} "
+                                    f"(semantically related)."
+                                ),
+                                "research_question": (
+                                    f"Does substituting the primary field of {expr} "
+                                    f"with {alt} preserve {mechanism}?"
+                                ),
+                                "parent": expr,
+                                "lineage": [expr] + lineage,
+                                "fields_used": extract_fields(swapped, field_ids),
+                            },
+                            "field-swap",
+                        )
                     )
 
         up = _window_change(expr, +1)
         if up:
+            target = self._last_window(up)
             mutations.append(
-                {
-                    "expression": up,
-                    "rationale": "Single window step up on the time-series operator.",
-                    "research_question": question("window step up"),
-                    "mutation": "window-up",
-                    "parent": expr,
-                    "lineage": [expr] + lineage,
-                    "fields_used": extract_fields(up, field_ids),
-                }
+                stamp(
+                    {
+                        "expression": up,
+                        "rationale": "Single window step up on the time-series operator.",
+                        "research_question": (
+                            f"Does {expr} survive a longer horizon neighbor "
+                            f"({target}d) for {mechanism}?"
+                        ),
+                        "parent": expr,
+                        "lineage": [expr] + lineage,
+                        "fields_used": extract_fields(up, field_ids),
+                    },
+                    "window-up",
+                )
             )
 
         down = _window_change(expr, -1)
         if down:
+            target = self._last_window(down)
             mutations.append(
-                {
-                    "expression": down,
-                    "rationale": "Single window step down on the time-series operator.",
-                    "research_question": question("window step down"),
-                    "mutation": "window-down",
-                    "parent": expr,
-                    "lineage": [expr] + lineage,
-                    "fields_used": extract_fields(down, field_ids),
-                }
+                stamp(
+                    {
+                        "expression": down,
+                        "rationale": "Single window step down on the time-series operator.",
+                        "research_question": (
+                            f"Does {expr} survive a shorter horizon neighbor "
+                            f"({target}d) for {mechanism}?"
+                        ),
+                        "parent": expr,
+                        "lineage": [expr] + lineage,
+                        "fields_used": extract_fields(down, field_ids),
+                    },
+                    "window-down",
+                )
             )
 
         if "ts_mean(" not in expr:
             smooth = f"ts_mean({expr}, 5)"
             mutations.append(
-                {
-                    "expression": smooth,
-                    "rationale": "Wrap in 5d ts_mean to reduce turnover.",
-                    "research_question": question("5d smoothing"),
-                    "mutation": "smooth-ts-mean-5",
-                    "parent": expr,
-                    "lineage": [expr] + lineage,
-                    "fields_used": extract_fields(smooth, field_ids),
-                }
+                stamp(
+                    {
+                        "expression": smooth,
+                        "rationale": "Wrap in 5d ts_mean to reduce turnover.",
+                        "research_question": (
+                            f"Does 5d smoothing of {expr} preserve {mechanism} "
+                            "at lower turnover?"
+                        ),
+                        "parent": expr,
+                        "lineage": [expr] + lineage,
+                        "fields_used": extract_fields(smooth, field_ids),
+                    },
+                    "smooth-ts-mean-5",
+                )
             )
 
         if "group_neutralize" not in expr:
             neutralized = f"group_neutralize({expr}, {g})"
             mutations.append(
-                {
-                    "expression": neutralized,
-                    "rationale": f"Add {g} neutralization layer.",
-                    "research_question": question("neutralization layer"),
-                    "mutation": f"neutralize-{g}",
-                    "parent": expr,
-                    "lineage": [expr] + lineage,
-                    "fields_used": extract_fields(neutralized, field_ids),
-                }
+                stamp(
+                    {
+                        "expression": neutralized,
+                        "rationale": f"Add {g} neutralization layer.",
+                        "research_question": (
+                            f"Does {g} neutralization of {expr} preserve "
+                            f"{mechanism}?"
+                        ),
+                        "parent": expr,
+                        "lineage": [expr] + lineage,
+                        "fields_used": extract_fields(neutralized, field_ids),
+                    },
+                    f"neutralize-{g}",
+                )
             )
 
         return mutations
+
+    @staticmethod
+    def _last_window(expression):
+        """The time-series window of a mutated expression (for questions)."""
+        matches = list(_TS_OP_RE.finditer(expression))
+        if not matches:
+            return None
+        return int(matches[-1].group(2))
 
     @staticmethod
     def _semantic_alt_field(expr, primary, field_ids, field_meta):

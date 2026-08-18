@@ -8,6 +8,7 @@ from .candidate import CandidateBuilder
 from .discovery import FieldDiscovery
 from .diversity import deduplicate
 from .failures import classify_error, is_research_relevant
+from .hypothesis import validate_contract
 from .memory import ExperienceMemory
 from .reflection import Reflector
 from .scheduler import BacktestScheduler
@@ -28,44 +29,200 @@ SEED_HYPOTHESES = [
     {
         "id": "h-seed-reversal",
         "statement": "Short-term return reversal: stocks that rose sharply over the last 5 days tend to revert in the near term.",
+        "research_question": "Does the raw short-window price-change signal revert with the expected negative sign?",
         "tags": ["reversal", "return", "price", "short-term"],
         "direction": "reversal",
         "datasets": ["pv1", "pv13"],
+        "economic_intuition": (
+            "Short-horizon liquidity demand and temporary buying/selling "
+            "pressure push prices past fair value; when the pressure abates "
+            "the price mean-reverts."
+        ),
+        "expected_mechanism": "temporary price pressure",
+        "field_semantics": {
+            "primary": {
+                "concept": "short_term_price_change",
+                "description": (
+                    "recent short-window price change proxying temporary "
+                    "price pressure"
+                ),
+            },
+            "secondary": [],
+        },
+        "expected_direction": {
+            "sign": "negative",
+            "note": "higher recent price change -> lower expected forward return",
+        },
+        "expected_horizon_days": 5,
+        "failure_condition": [
+            "related short-window price fields consistently fail across lineages",
+            "the sign is positive across independent lineages",
+            "the effect disappears after basic neutralization",
+            "reasonable horizon neighbors (10d/20d) collapse the signal",
+        ],
     },
     {
         "id": "h-seed-analyst",
         "statement": "Analyst target-price revisions upward predict short-term outperformance.",
+        "research_question": "Does a rise in analyst target price carry the expected positive forward-return sign?",
         "tags": ["analyst", "forecast", "revision", "target"],
         "direction": "long",
         "datasets": ["analyst4"],
+        "economic_intuition": (
+            "Analysts revise target prices when new information arrives; the "
+            "market underreacts temporarily and prices drift toward the "
+            "revised fair value."
+        ),
+        "expected_mechanism": "analyst information revision",
+        "field_semantics": {
+            "primary": {
+                "concept": "target_price_revision",
+                "description": "change in analyst target price or recommendation level",
+            },
+            "secondary": [
+                {
+                    "concept": "estimate_revision",
+                    "description": "change in analyst EPS estimate",
+                },
+            ],
+        },
+        "expected_direction": {
+            "sign": "positive",
+            "note": "upward revision -> higher expected forward return",
+        },
+        "expected_horizon_days": 10,
+        "failure_condition": [
+            "revision fields show the opposite sign across lineages",
+            "the signal vanishes after subindustry neutralization",
+            "level fields behave identically to revision fields (no revision content)",
+        ],
     },
     {
         "id": "h-seed-option",
         "statement": "Stocks with elevated implied volatility earn lower forward returns.",
+        "research_question": "Does elevated implied volatility predict lower forward returns (risk premium)?",
         "tags": ["option", "volatility", "implied", "risk"],
         "direction": "reversal",
         "datasets": ["option8", "option9"],
+        "economic_intuition": (
+            "Option-implied volatility is high when the market demands "
+            "compensation for uncertainty; high-volatility names subsequently "
+            "earn lower forward returns."
+        ),
+        "expected_mechanism": "risk-premium compensation",
+        "field_semantics": {
+            "primary": {
+                "concept": "implied_volatility",
+                "description": "option-implied volatility level or skew",
+            },
+            "secondary": [],
+        },
+        "expected_direction": {
+            "sign": "negative",
+            "note": "higher implied volatility -> lower expected forward return",
+        },
+        "expected_horizon_days": 20,
+        "failure_condition": [
+            "implied-vol fields show positive sign across lineages",
+            "the effect disappears after volatility neutralization",
+            "short-horizon neighbors invert the sign",
+        ],
     },
     {
         "id": "h-seed-model",
         "statement": "High model risk scores predict lower forward returns.",
+        "research_question": "Do high composite model risk scores predict lower forward returns?",
         "tags": ["model", "score", "risk", "composite"],
         "direction": "reversal",
         "datasets": ["model16", "model51"],
+        "economic_intuition": (
+            "Composite model risk scores aggregate exposure to hard-to-price "
+            "uncertainty; risk-loaded names earn lower forward returns in "
+            "aggregate."
+        ),
+        "expected_mechanism": "risk-premium compensation",
+        "field_semantics": {
+            "primary": {
+                "concept": "model_risk_score",
+                "description": "composite model risk or factor-loading score",
+            },
+            "secondary": [],
+        },
+        "expected_direction": {
+            "sign": "negative",
+            "note": "higher risk score -> lower expected forward return",
+        },
+        "expected_horizon_days": 20,
+        "failure_condition": [
+            "risk-score fields predict positive returns across lineages",
+            "the effect is explained away by sector exposure",
+            "horizon neighbors collapse the signal",
+        ],
     },
     {
         "id": "h-seed-news",
         "statement": "Positive news sentiment predicts short-term positive returns.",
+        "research_question": "Does positive news sentiment predict positive forward returns over the near term?",
         "tags": ["news", "sentiment", "positive"],
         "direction": "long",
         "datasets": ["news12", "news18"],
+        "economic_intuition": (
+            "Attention-grabbing positive news is incompletely priced at the "
+            "close, so sentiment continues to drift up over the following days."
+        ),
+        "expected_mechanism": "sentiment continuation",
+        "field_semantics": {
+            "primary": {
+                "concept": "news_sentiment",
+                "description": "aggregate news sentiment or headline tone score",
+            },
+            "secondary": [
+                {
+                    "concept": "news_attention",
+                    "description": "news volume or headline buzz",
+                },
+            ],
+        },
+        "expected_direction": {
+            "sign": "positive",
+            "note": "more positive sentiment -> higher forward return",
+        },
+        "expected_horizon_days": 5,
+        "failure_condition": [
+            "sentiment fields show negative sign across lineages",
+            "the effect reverses after basic neutralization",
+            "a 10d horizon neighbor collapses the continuation",
+        ],
     },
     {
         "id": "h-seed-fundamental",
         "statement": "Firms with strong earnings growth continue to outperform.",
+        "research_question": "Does strong earnings growth predict continued outperformance?",
         "tags": ["fundamental", "growth", "earning"],
         "direction": "long",
         "datasets": ["fundamental2", "fundamental6"],
+        "economic_intuition": (
+            "Earnings information diffuses gradually; firms with accelerating "
+            "earnings keep outperforming as the information is impounded."
+        ),
+        "expected_mechanism": "earnings information diffusion",
+        "field_semantics": {
+            "primary": {
+                "concept": "earnings_growth",
+                "description": "earnings or revenue growth level and its recent change",
+            },
+            "secondary": [],
+        },
+        "expected_direction": {
+            "sign": "positive",
+            "note": "higher growth -> higher expected forward return",
+        },
+        "expected_horizon_days": 60,
+        "failure_condition": [
+            "growth fields predict negative returns across lineages",
+            "the effect is fully neutralized by value/size exposure",
+            "quarterly changes show no predictive content",
+        ],
     },
 ]
 
@@ -160,7 +317,9 @@ class Agent:
         fields = self._last_fields
         if split["explore"] > 0:
             fields = self.discovery.discover(
-                hypothesis, target_count=self.fields_per_discovery
+                hypothesis,
+                target_count=self.fields_per_discovery,
+                require_field_semantics=True,
             )
             if not fields:
                 # Fall back to previously discovered fields (cache reuse).
@@ -183,7 +342,7 @@ class Agent:
             )
             if active:
                 candidates += self.builder.build_deepen(
-                    fields, active, split["deepen"]
+                    fields, active, split["deepen"], hypothesis=hypothesis
                 )
 
         if not candidates:
@@ -242,6 +401,8 @@ class Agent:
             )
             exp.mutation = c.get("mutation")
             exp.rationale = c.get("rationale")
+            exp.research_question = c.get("research_question")
+            exp.mechanism = c.get("mechanism")
             experiments.append(exp)
         return experiments
 
@@ -281,6 +442,10 @@ class Agent:
                 explore = max(0, n - deepen)
 
         hypothesis = self._choose_hypothesis(round_no)
+        # A research contract is mandatory before any candidate is built or
+        # simulated: the system must already know the mechanism, the field
+        # meaning, the expected sign and horizon, and the failure condition.
+        validate_contract(hypothesis)
         return {
             "hypothesis": hypothesis,
             "split": {"explore": explore, "deepen": deepen},

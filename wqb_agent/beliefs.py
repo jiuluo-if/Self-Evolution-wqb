@@ -57,11 +57,21 @@ def belief_identity(hypothesis_id, fields, hypothesis=None, direction=None):
 
 
 def belief_claim(hypothesis_id, fields, hypothesis=None, direction=None,
-                 horizon=None):
-    """A human-readable statement of the belief the key represents."""
+                 horizon=None, mechanism=None):
+    """A human-readable statement of the belief the key represents.
+
+    `mechanism` and `horizon` are research metadata of the hypothesis contract
+    and are shown in the claim text only. They deliberately stay OUT of the
+    belief key so older memory schema keeps loading and two experiments that
+    differ only in contract metadata still aggregate.
+    """
     direction = _direction(hypothesis, direction)
     if horizon is None and hypothesis:
-        horizon = hypothesis.get("horizon")
+        horizon = (
+            hypothesis.get("expected_horizon_days") or hypothesis.get("horizon")
+        )
+    if mechanism is None and hypothesis:
+        mechanism = hypothesis.get("expected_mechanism")
     norm = normalize_fields(fields)
     label = ",".join(norm) if norm else "?"
     dir_desc = direction if direction else "the hypothesis"
@@ -71,6 +81,8 @@ def belief_claim(hypothesis_id, fields, hypothesis=None, direction=None,
         f"used in direction {dir_desc}",
         "are expected to predict forward returns",
     ]
+    if mechanism:
+        parts.append(f"capturing {mechanism}")
     if horizon:
         parts.append(f"over horizon {horizon}")
     return " ".join(parts)

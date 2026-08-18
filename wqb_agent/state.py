@@ -58,6 +58,8 @@ class Experiment:
         self.progress_url = None
         self.mutation = None
         self.rationale = None
+        self.research_question = None
+        self.mechanism = None
         self.created_at = time.time()
 
     def to_dict(self):
@@ -77,6 +79,8 @@ class Experiment:
             "progress_url": self.progress_url,
             "mutation": self.mutation,
             "rationale": self.rationale,
+            "research_question": self.research_question,
+            "mechanism": self.mechanism,
             "created_at": self.created_at,
         }
 
@@ -99,6 +103,8 @@ class Experiment:
         exp.progress_url = data.get("progress_url")
         exp.mutation = data.get("mutation")
         exp.rationale = data.get("rationale")
+        exp.research_question = data.get("research_question")
+        exp.mechanism = data.get("mechanism")
         exp.created_at = data.get("created_at", 0)
         return exp
 
