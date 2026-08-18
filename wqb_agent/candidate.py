@@ -181,6 +181,8 @@ class CandidateBuilder:
                         f"Exploration on {primary} via "
                         f"{_family_for(hypothesis)} family."
                     ),
+                    "research_question": hypothesis.get("statement", ""),
+                    "hypothesis_id": hypothesis.get("id"),
                     "mutation": "explore",
                     "parent": None,
                     "lineage": [],
@@ -231,6 +233,9 @@ class CandidateBuilder:
         primary = self._primary_field(expr, field_ids)
         g = self.neutralization
         mutations = []
+        question = (
+            lambda m: f"Does a single {m} on {expr} improve lineage performance?"
+        )
 
         if primary:
             alt = self._semantic_alt_field(expr, primary, field_ids, field_meta)
@@ -244,6 +249,7 @@ class CandidateBuilder:
                                 f"Single-variable field swap: {primary} -> {alt} "
                                 f"(semantically related)."
                             ),
+                            "research_question": question("field swap"),
                             "mutation": "field-swap",
                             "parent": expr,
                             "lineage": [expr] + lineage,
@@ -257,6 +263,7 @@ class CandidateBuilder:
                 {
                     "expression": up,
                     "rationale": "Single window step up on the time-series operator.",
+                    "research_question": question("window step up"),
                     "mutation": "window-up",
                     "parent": expr,
                     "lineage": [expr] + lineage,
@@ -270,6 +277,7 @@ class CandidateBuilder:
                 {
                     "expression": down,
                     "rationale": "Single window step down on the time-series operator.",
+                    "research_question": question("window step down"),
                     "mutation": "window-down",
                     "parent": expr,
                     "lineage": [expr] + lineage,
@@ -283,6 +291,7 @@ class CandidateBuilder:
                 {
                     "expression": smooth,
                     "rationale": "Wrap in 5d ts_mean to reduce turnover.",
+                    "research_question": question("5d smoothing"),
                     "mutation": "smooth-ts-mean-5",
                     "parent": expr,
                     "lineage": [expr] + lineage,
@@ -296,6 +305,7 @@ class CandidateBuilder:
                 {
                     "expression": neutralized,
                     "rationale": f"Add {g} neutralization layer.",
+                    "research_question": question("neutralization layer"),
                     "mutation": f"neutralize-{g}",
                     "parent": expr,
                     "lineage": [expr] + lineage,

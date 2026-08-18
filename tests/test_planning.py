@@ -49,6 +49,41 @@ class TestPlanning(unittest.TestCase):
         chosen = agent._choose_hypothesis(2)
         self.assertNotEqual(chosen["id"], "h-seed-reversal")
 
+    def test_infra_failures_do_not_park_hypothesis(self):
+        # Timeouts / auth / rate-limit / 5xx failures are environmental; they
+        # must not pause a research direction or inflate its failure count.
+        tmpdir = tempfile.mkdtemp()
+        agent, _ = make_agent(tmpdir, rounds=2)
+        for error in (
+            "WQBTimeoutError: Simulation polling timed out.",
+            "WQBSimulationError: connection refused",
+            "WQBAuthError: Authentication rejected (401).",
+            "WQBRateLimitError: 429 rate limited",
+        ):
+            e = Experiment(1, "h-seed-reversal", "rank(x)", {}, [])
+            e.status = "FAILED"
+            e.error = error
+            agent.trajectory.add(e)
+        self.assertNotIn("h-seed-reversal", agent._parked_hypotheses())
+        self.assertEqual(
+            agent._hypothesis_failure_counts().get("h-seed-reversal", 0), 0
+        )
+
+    def test_research_failure_mixed_with_infra_does_not_park(self):
+        # One genuine research failure plus an infra failure is not two
+        # research failures in a row.
+        tmpdir = tempfile.mkdtemp()
+        agent, _ = make_agent(tmpdir, rounds=2)
+        for error in (
+            "WQBRejectedError: 422 invalid",
+            "WQBTimeoutError: Simulation polling timed out.",
+        ):
+            e = Experiment(1, "h-seed-reversal", "rank(x)", {}, [])
+            e.status = "FAILED"
+            e.error = error
+            agent.trajectory.add(e)
+        self.assertNotIn("h-seed-reversal", agent._parked_hypotheses())
+
     def test_unused_hypotheses_preferred(self):
         tmpdir = tempfile.mkdtemp()
         agent, _ = make_agent(tmpdir, rounds=2)

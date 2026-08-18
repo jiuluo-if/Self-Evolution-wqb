@@ -200,5 +200,160 @@ class TestSchedulerCheckpoint(unittest.TestCase):
         self.assertEqual(client2.counter, 2, "only the two new expressions run")
 
 
+class TestSchedulerMidFlight(unittest.TestCase):
+    """A crash after submit but before finalize must not re-submit the same
+    expression (exactly-once at the backend level)."""
+
+    def _path(self, tmpdir):
+        return os.path.join(tmpdir, "jobs.json")
+
+    def _make_checkpoint(self, tmpdir, done_expr, running_expr):
+        """Hand-craft a checkpoint as it looks after a mid-flight crash:
+        one completed job plus one job submitted but never finalized."""
+        import json
+
+        done = make_experiments([done_expr])
+        done[0].status = "DONE"
+        done[0].metrics = {"sharpe": 1.0, "fitness": 1.0}
+        running = make_experiments([running_expr])
+        running[0].status = "RUNNING"
+
+        data = {
+            "schema_version": 1,
+            "submitted": 2,
+            "running": [running[0].to_dict()],
+            "completed": [done[0].to_dict()],
+            "failed": [],
+        }
+        path = self._path(tmpdir)
+        with open(path, "w") as f:
+            json.dump(data, f)
+        return path
+
+    def test_midflight_crash_is_not_resubmitted(self):
+        tmpdir = tempfile.mkdtemp()
+        done_expr, crashed_expr, fresh_expr = (
+            "rank(f0)", "rank(f1)", "rank(f2)")
+        path = self._make_checkpoint(tmpdir, done_expr, crashed_expr)
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([done_expr, crashed_expr, fresh_expr])
+        sched.add_jobs(jobs)
+        sched.run()
+
+        self.assertEqual(
+            client.counter, 1,
+            "only the never-submitted expression may run",
+        )
+        self.assertEqual(client.submissions, [fresh_expr])
+        by_expr = {j.expression: j for j in jobs}
+        self.assertEqual(by_expr[done_expr].status, "DONE")
+        self.assertEqual(by_expr[done_expr].metrics["sharpe"], 1.0)
+        self.assertEqual(by_expr[crashed_expr].status, "FAILED")
+        self.assertIn("crash_mid_flight", by_expr[crashed_expr].error)
+        self.assertEqual(by_expr[fresh_expr].status, "DONE")
+
+    def test_midflight_consumed_budget_survives_resume(self):
+        # The crash consumed budget on the backend; resuming must not mint
+        # that budget back, or the cap would be silently exceeded.
+        tmpdir = tempfile.mkdtemp()
+        done_expr, crashed_expr = "rank(f0)", "rank(f1)"
+        path = self._make_checkpoint(tmpdir, done_expr, crashed_expr)
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=2,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([done_expr, crashed_expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.counter, 0, "nothing left under the budget")
+
+    def test_double_crash_keeps_midflight_out_of_submission(self):
+        # A mid-flight job turned FAILED on the first resume, then the process
+        # crashed again: the second resume must still refuse to re-submit it.
+        import json
+
+        tmpdir = tempfile.mkdtemp()
+        crashed_expr = "rank(f1)"
+        done = make_experiments(["rank(f0)"])
+        done[0].status = "DONE"
+        done[0].metrics = {"sharpe": 1.0}
+        failed = make_experiments([crashed_expr])
+        failed[0].status = "FAILED"
+        failed[0].error = "crash_mid_flight: simulation was submitted but never finalized"
+        data = {
+            "schema_version": 1,
+            "submitted": 2,
+            "running": [],
+            "completed": [done[0].to_dict()],
+            "failed": [failed[0].to_dict()],
+        }
+        path = self._path(tmpdir)
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([crashed_expr, "rank(f9)"])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.submissions, ["rank(f9)"])
+        self.assertEqual(
+            {j.expression: j.status for j in jobs},
+            {crashed_expr: "FAILED", "rank(f9)": "DONE"},
+        )
+
+    def test_midflight_state_persisted_before_submit(self):
+        # The RUNNING job must be in the checkpoint at the moment the backend
+        # submit call executes, i.e. the checkpoint happens before submit.
+        class BlockingClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def submit_simulation(self, expression, settings, alpha_type="REGULAR"):
+                self.entered.set()
+                self.release.wait(timeout=5)
+                return super().submit_simulation(
+                    expression, settings, alpha_type=alpha_type)
+
+        import json
+
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        client = BlockingClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=1, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments(["rank(f0)"])
+        sched.add_jobs(jobs)
+
+        worker = threading.Thread(target=sched.run)
+        worker.start()
+        self.assertTrue(client.entered.wait(timeout=5))
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(len(data.get("running", [])), 1)
+        self.assertEqual(data["running"][0]["expression"], "rank(f0)")
+        self.assertEqual(data["running"][0]["status"], "RUNNING")
+        self.assertEqual(data["submitted"], 1)
+
+        client.release.set()
+        worker.join(timeout=10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(jobs[0].status, "DONE")
+
+
 if __name__ == "__main__":
     unittest.main()

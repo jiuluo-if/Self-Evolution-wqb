@@ -6,6 +6,7 @@ import time
 from .candidate import CandidateBuilder
 from .discovery import FieldDiscovery
 from .diversity import deduplicate
+from .failures import classify_error, is_research_relevant
 from .memory import ExperienceMemory
 from .reflection import Reflector
 from .scheduler import BacktestScheduler
@@ -305,21 +306,30 @@ class Agent:
         return dict(candidates[0])
 
     def _parked_hypotheses(self):
-        """A hypothesis whose last two experiments both failed is parked until
-        evidence suggests revisiting it (failure history steering)."""
+        """A hypothesis whose last two experiments both failed for
+        research-level reasons is parked until evidence suggests revisiting it.
+        Infrastructure failures (timeout / auth / rate-limit / 5xx) carry no
+        research signal and must not pause a direction."""
         by_hypothesis = {}
         for exp in self.trajectory.experiments:
             by_hypothesis.setdefault(exp.hypothesis_id, []).append(exp)
         parked = set()
         for hid, exps in by_hypothesis.items():
-            if len(exps) >= 2 and all(e.status == "FAILED" for e in exps[-2:]):
+            research_fails = [
+                e for e in exps[-2:]
+                if e.status == "FAILED"
+                and is_research_relevant(classify_error(e.error))
+            ]
+            if len(research_fails) >= 2:
                 parked.add(hid)
         return parked
 
     def _hypothesis_failure_counts(self):
         counts = {}
         for exp in self.trajectory.experiments:
-            if exp.status == "FAILED":
+            if exp.status == "FAILED" and is_research_relevant(
+                classify_error(exp.error)
+            ):
                 counts[exp.hypothesis_id] = counts.get(exp.hypothesis_id, 0) + 1
         return counts
 

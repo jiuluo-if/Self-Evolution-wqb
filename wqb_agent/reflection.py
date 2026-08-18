@@ -128,6 +128,7 @@ class Reflector:
             "round": exp.round,
             "hypothesis_id": exp.hypothesis_id,
             "expression": exp.expression,
+            "lineage": list(exp.lineage),
             "mutation": exp.mutation,
             "fields": list(exp.fields_used),
             "metrics": {

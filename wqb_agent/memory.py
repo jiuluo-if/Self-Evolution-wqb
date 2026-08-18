@@ -77,6 +77,8 @@ class ExperienceMemory:
         for lesson in self.lessons:
             rounds = lesson.get("source_rounds") or []
             lesson["source_rounds"] = set(rounds)
+            roots = lesson.get("lineage_roots") or []
+            lesson["lineage_roots"] = set(roots)
         return self
 
     def save(self):
@@ -117,6 +119,10 @@ class ExperienceMemory:
                 lesson["confidence"] = min(1.0, lesson.get("confidence", 0) + 0.15)
                 lesson.setdefault("source_rounds", set()).add(source_round)
                 self._append_evidence(lesson, source)
+                if source:
+                    lesson.setdefault("lineage_roots", set()).add(
+                        self._lineage_root(source)
+                    )
                 lesson["tier"] = self._tier_for(lesson)
                 lesson["updated"] = time.time()
                 return lesson
@@ -125,6 +131,7 @@ class ExperienceMemory:
             "claim": claim,
             "source_round": source_round,
             "source_rounds": {source_round},
+            "lineage_roots": {self._lineage_root(source)} if source else set(),
             "evidence": evidence,
             "confidence": min(confidence, 1.0),
             "evidence_log": [],
@@ -137,6 +144,19 @@ class ExperienceMemory:
         self.lessons.append(entry)
         return entry
 
+    @staticmethod
+    def _lineage_root(source):
+        """The research direction an evidence item genuinely starts from: the
+        deepest ancestor for a deepened lineage, the expression itself for a
+        fresh exploration. Repeated confirmations along one root are not
+        independent evidence."""
+        if not source:
+            return None
+        lineage = source.get("lineage") or []
+        if lineage:
+            return lineage[-1]
+        return source.get("expression") or source.get("experiment_id")
+
     def _append_evidence(self, lesson, source, max_log=5):
         """Record the real experiment behind an evidence increment."""
         if not source:
@@ -146,12 +166,18 @@ class ExperienceMemory:
         del log[max_log:]
 
     def _tier_for(self, lesson):
-        """Long-term requires both accumulated evidence AND independent
-        experiments across multiple rounds — a single success must not
-        become long-term by itself."""
+        """Long-term requires accumulated evidence AND confirmation across
+        independent research lineages AND distinct rounds — repeated hits along
+        one lineage, even spread over several rounds, are a single line of
+        evidence and must not be promoted on their own."""
         evidence = lesson.get("evidence", 0)
         rounds = lesson.get("source_rounds") or set()
-        if evidence >= self.promote_evidence and len(rounds) >= 2:
+        roots = lesson.get("lineage_roots") or set()
+        if (
+            evidence >= self.promote_evidence
+            and len(rounds) >= 2
+            and len(roots) >= 2
+        ):
             return "long"
         return "short"
 

@@ -270,6 +270,36 @@ class TestCandidateBuilder(unittest.TestCase):
             self.assertEqual(c["lineage"][0], "rank(ts_mean(returns, 5))")
             self.assertEqual(c["lineage"][1], "rank(returns)")
 
+    def test_candidate_explains_question_parent_mutation(self):
+        builder = CandidateBuilder()
+        fields = [{"id": "returns"}, {"id": "volume"}]
+        hypothesis = {
+            "id": "h-test",
+            "statement": "Short-term return reversal should revert.",
+            "direction": "reversal",
+            "tags": ["reversal"],
+        }
+        explore = builder.build_explore(hypothesis, fields, 2)
+        self.assertEqual(len(explore), 2)
+        for c in explore:
+            self.assertEqual(c["mutation"], "explore")
+            self.assertIsNone(c["parent"])
+            self.assertEqual(c["hypothesis_id"], "h-test")
+            self.assertIn("revert", c["research_question"])
+
+        alpha = {
+            "expression": "rank(ts_mean(returns, 5))",
+            "lineage": ["rank(returns)"],
+            "attempts": 1,
+            "best_score": 1.1,
+        }
+        deepen = builder.build_deepen(fields, [alpha], 5)
+        self.assertGreater(len(deepen), 0)
+        for c in deepen:
+            self.assertEqual(c["parent"], alpha["expression"])
+            self.assertNotEqual(c["mutation"], "explore")
+            self.assertIn(alpha["expression"], c["research_question"])
+
 
 class TestSimulator(unittest.TestCase):
     def test_concurrency_limited(self):
@@ -340,6 +370,10 @@ class TestReflection(unittest.TestCase):
         self.assertEqual(
             summary["suspicious"][0]["status"], "SUSPICIOUS_HIGH_SIGNAL"
         )
+        # A high-signal alpha must not be upgraded to the submission pool or
+        # current best before perturbation validation approves it.
+        self.assertEqual(len(memory.submission_pool), 0)
+        self.assertIsNone(memory.current_best)
 
     def test_pool_rejects_redundant(self):
         memory = ExperienceMemory(state_dir="/tmp/wqb_test_pool")
@@ -377,11 +411,61 @@ class TestMemory(unittest.TestCase):
 
     def test_lesson_promotion_to_long_term(self):
         memory = ExperienceMemory(state_dir="/tmp/wqb_test_tier")
+        # Evidence without a traceable source lineage can never be promoted.
         memory.add_lesson("Field returns ranks weakly", 1, evidence=2)
         memory.add_lesson("Field returns ranks weakly", 2, evidence=2)
+        self.assertEqual(memory.lessons[0]["tier"], "short")
+        # Two independent research lineages across rounds promote.
+        memory.add_lesson(
+            "Field returns ranks weakly", 3, evidence=1,
+            source={"expression": "rank(a)", "lineage": ["rootA"], "round": 3},
+        )
+        memory.add_lesson(
+            "Field returns ranks weakly", 4, evidence=1,
+            source={"expression": "rank(b)", "lineage": ["rootB"], "round": 4},
+        )
         lesson = memory.lessons[0]
         self.assertEqual(lesson["tier"], "long")
         self.assertGreaterEqual(lesson["evidence"], memory.promote_evidence)
+
+    def test_same_lineage_across_rounds_is_not_independent(self):
+        # Three confirmations along ONE lineage root, even over three rounds,
+        # are a single line of evidence and must stay short-term.
+        memory = ExperienceMemory(state_dir="/tmp/wqb_test_tier_sameline")
+        for round_no in (1, 2, 3):
+            memory.add_lesson(
+                "Rank fields on returns is predictive", round_no, evidence=1,
+                source={
+                    "expression": f"rank(v{round_no})",
+                    "lineage": ["rootX", "mid", "parent"],
+                    "round": round_no,
+                },
+            )
+        lesson = memory.lessons[0]
+        self.assertEqual(lesson["evidence"], 3)
+        self.assertEqual(len(lesson["source_rounds"]), 3)
+        self.assertEqual(lesson["tier"], "short")
+
+    def test_multi_round_single_lineage_never_promotes(self):
+        # Deepening the same alpha lineage over many rounds must never mint
+        # independent evidence for a long-term belief.
+        memory = ExperienceMemory(state_dir="/tmp/wqb_test_tier_deepen")
+        source = {
+            "expression": "rank(ts_mean(returns, 5))",
+            "lineage": ["rank(returns)"],
+            "round": 1,
+        }
+        for round_no in (1, 2, 3, 4):
+            src = dict(source, round=round_no, expression=source["expression"])
+            memory.add_lesson(
+                "Return reversal persists on short horizon", round_no,
+                evidence=1, source=src,
+            )
+        self.assertEqual(memory.lessons[0]["tier"], "short")
+        self.assertEqual(
+            len(memory.lessons[0]["lineage_roots"]), 1,
+            "one root, one lineage of evidence",
+        )
 
     def test_stale_short_lesson_archived(self):
         memory = ExperienceMemory(state_dir="/tmp/wqb_test_stale")
@@ -542,10 +626,16 @@ class TestAgentLoop(unittest.TestCase):
         config["agent"]["state_dir"] = tmpdir
         config["agent"]["max_rounds"] = 1
         agent = Agent(HighSignalClient(), config)
+        client = agent.client
         agent.run_one_round(1)
         self.assertGreaterEqual(len(agent.memory.submission_pool), 1)
         statuses = {r["status"] for r in agent.memory.submission_pool}
         self.assertIn("VALIDATED_HIGH_SIGNAL", statuses)
+        # Simulation + validation must stay inside the unified scheduler budget.
+        self.assertLessEqual(
+            client.counter,
+            agent.sim_budget_per_round + agent.validation_budget,
+        )
 
     def test_full_loop_state_persisted(self):
         tmpdir = "/tmp/wqb_test_agent"

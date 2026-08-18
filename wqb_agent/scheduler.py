@@ -48,6 +48,10 @@ class BacktestScheduler:
         self._completed = {}  # job_id -> Experiment (DONE)
         self._failed = {}  # job_id -> Experiment (FAILED)
         self._submitted = 0
+        # Expressions submitted to the backend in a previous run but never
+        # finalized (process crashed mid-flight). They must never be submitted
+        # again: the backend already owns a simulation for them.
+        self._no_retry = set()
         self._since_checkpoint = 0
         self.created_at = time.time()
         self.updated_at = time.time()
@@ -55,18 +59,16 @@ class BacktestScheduler:
     # ---- job intake ----
 
     def add_jobs(self, experiments):
-        """Queue experiments. Experiments whose expression is already recorded
-        as completed in a checkpoint are restored instead of re-executed."""
+        """Queue experiments. Experiments whose expression already has a
+        recorded outcome (completed, or submitted before a crash) are restored
+        instead of being executed again."""
         for exp in experiments:
             if exp.id in self._jobs:
                 continue
-            prior = self._completed_by_expression(exp.expression)
-            if prior is not None:
-                self._restore_result(exp, prior)
-                self._completed[exp.id] = exp
+            if self._restore_prior(exp):
                 logger.info(
                     "BACKTEST_JOB_REUSED job_id=%s expression=%s "
-                    "(previously completed, not re-run)",
+                    "(previously handled, not re-run)",
                     exp.id,
                     exp.expression[:60],
                 )
@@ -81,6 +83,32 @@ class BacktestScheduler:
             if exp.expression == expression:
                 return exp
         return None
+
+    def _failed_by_expression(self, expression):
+        for exp in self._failed.values():
+            if exp.expression == expression:
+                return exp
+        return None
+
+    def _restore_prior(self, exp):
+        """If this expression was handled in a previous run (completed, or
+        submitted to the backend but never finalized before a crash), restore
+        the recorded outcome on `exp` and return True."""
+        prior = self._completed_by_expression(exp.expression)
+        if prior is not None:
+            self._restore_result(exp, prior)
+            self._completed[exp.id] = exp
+            return True
+        if exp.expression in self._no_retry:
+            prior = self._failed_by_expression(exp.expression)
+            if prior is not None:
+                self._restore_result(exp, prior)
+            else:
+                exp.status = "FAILED"
+                exp.error = "crash_mid_flight: not re-submitted"
+            self._failed[exp.id] = exp
+            return True
+        return False
 
     @staticmethod
     def _restore_result(target, prior):
@@ -122,17 +150,14 @@ class BacktestScheduler:
 
     def _drop_completed_from_queue(self):
         """After resume, restore results for queued jobs whose expression was
-        already completed and keep the rest."""
+        already handled in a previous run and keep the rest."""
         remaining = deque()
         for job_id in self._queue:
             exp = self._jobs[job_id]
-            prior = self._completed_by_expression(exp.expression)
-            if prior is not None:
-                self._restore_result(exp, prior)
-                self._completed[job_id] = exp
+            if self._restore_prior(exp):
                 logger.info(
                     "BACKTEST_JOB_REUSED job_id=%s expression=%s "
-                    "(previously completed, not re-run)",
+                    "(previously handled, not re-run)",
                     job_id,
                     exp.expression[:60],
                 )
@@ -156,11 +181,16 @@ class BacktestScheduler:
             exp = self._jobs[job_id]
             self._submitted += 1
             self._running.add(job_id)
+            exp.status = "RUNNING"
             logger.info(
                 "BACKTEST_JOB_STARTED job_id=%s expression=%s",
                 job_id,
                 exp.expression[:60],
             )
+            # Persist the in-flight state BEFORE submitting to the backend so
+            # a crash after this point resumes without re-submitting the same
+            # expression (the backend already owns a simulation for it).
+            self._checkpoint()
             running[pool.submit(self._simulate_job, job_id)] = job_id
 
     def _simulate_job(self, job_id):
@@ -204,6 +234,9 @@ class BacktestScheduler:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "submitted": self._submitted,
+            "running": [
+                self._jobs[job_id].to_dict() for job_id in self._running
+            ],
             "completed": [
                 exp.to_dict() for exp in self._completed.values()
             ],
@@ -231,10 +264,34 @@ class BacktestScheduler:
             exp = Experiment.from_dict(edict)
             self._jobs[exp.id] = exp
             self._failed[exp.id] = exp
+            if "crash_mid_flight" in (exp.error or ""):
+                # A previous resume already turned a mid-flight job into a
+                # FAILED outcome; keep it out of the submission path even if
+                # the process crashed again before checkpointing it as such.
+                self._no_retry.add(exp.expression)
+        for edict in data.get("running", []):
+            # Submitted to the backend but never finalized before the crash.
+            # Mark FAILED and forbid re-submission: retrying would create a
+            # duplicate simulation for the same expression.
+            exp = Experiment.from_dict(edict)
+            self._jobs[exp.id] = exp
+            exp.status = "FAILED"
+            exp.error = (
+                "crash_mid_flight: simulation was submitted but never finalized"
+            )
+            self._failed[exp.id] = exp
+            self._no_retry.add(exp.expression)
+            logger.warning(
+                "BACKTEST_JOB_MIDFLIGHT job_id=%s expression=%s "
+                "marked failed, not re-submitted",
+                exp.id,
+                exp.expression[:60],
+            )
         logger.info(
-            "SCHEDULER_RESUMED path=%s completed=%d failed=%d submitted=%d",
+            "SCHEDULER_RESUMED path=%s completed=%d failed=%d midflight=%d "
+            "submitted=%d",
             self.checkpoint_path, len(self._completed), len(self._failed),
-            self._submitted,
+            len(self._no_retry), self._submitted,
         )
 
     # ---- introspection ----
