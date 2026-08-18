@@ -52,6 +52,10 @@ class Experiment:
         self.metrics = None
         self.error = None
         self.alpha_id = None
+        # Remote simulation endpoint. Once the backend created the simulation
+        # (POST /simulations returned a Location), this URL is persisted
+        # immediately so a crash can resume polling instead of re-submitting.
+        self.progress_url = None
         self.mutation = None
         self.rationale = None
         self.created_at = time.time()
@@ -70,6 +74,7 @@ class Experiment:
             "metrics": self.metrics,
             "error": self.error,
             "alpha_id": self.alpha_id,
+            "progress_url": self.progress_url,
             "mutation": self.mutation,
             "rationale": self.rationale,
             "created_at": self.created_at,
@@ -91,6 +96,7 @@ class Experiment:
         exp.metrics = data.get("metrics")
         exp.error = data.get("error")
         exp.alpha_id = data.get("alpha_id")
+        exp.progress_url = data.get("progress_url")
         exp.mutation = data.get("mutation")
         exp.rationale = data.get("rationale")
         exp.created_at = data.get("created_at", 0)

@@ -11,6 +11,7 @@ responsible for a single submit -> poll -> fetch cycle.
 import json
 import logging
 import os
+import threading
 import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -53,6 +54,10 @@ class BacktestScheduler:
         # again: the backend already owns a simulation for them.
         self._no_retry = set()
         self._since_checkpoint = 0
+        # Worker threads checkpoint() right after a successful backend submit
+        # to persist the recoverable progress_url; the lock keeps concurrent
+        # checkpoints from interleaving on the tmp file.
+        self._checkpoint_lock = threading.Lock()
         self.created_at = time.time()
         self.updated_at = time.time()
 
@@ -124,6 +129,12 @@ class BacktestScheduler:
         self._drop_completed_from_queue()
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as pool:
             running = {}
+            # Jobs restored from a checkpoint (submitted/polling, or pending
+            # with a reserved budget slot) are already in self._running; kick
+            # them off first so they never go through the budget reserve path
+            # again.
+            for job_id in list(self._running):
+                running[pool.submit(self._run_job, job_id)] = job_id
             self._fill_pipeline(pool, running)
             while self._queue or running:
                 if not running:
@@ -179,23 +190,41 @@ class BacktestScheduler:
                 break
             job_id = self._queue.popleft()
             exp = self._jobs[job_id]
+            # Reserve the budget slot for this job. The value survives crashes
+            # via the checkpoint and is never re-minted, so a resumed job that
+            # already owns a slot is never charged twice.
             self._submitted += 1
             self._running.add(job_id)
-            exp.status = "RUNNING"
+            exp.status = "PENDING"
             logger.info(
                 "BACKTEST_JOB_STARTED job_id=%s expression=%s",
                 job_id,
                 exp.expression[:60],
             )
             # Persist the in-flight state BEFORE submitting to the backend so
-            # a crash after this point resumes without re-submitting the same
-            # expression (the backend already owns a simulation for it).
+            # a crash before this point resumes as a plain (re-)submit, and a
+            # crash after submit+checkpoint resumes as a poll of the existing
+            # simulation.
             self._checkpoint()
-            running[pool.submit(self._simulate_job, job_id)] = job_id
+            running[pool.submit(self._run_job, job_id)] = job_id
 
-    def _simulate_job(self, job_id):
+    def _run_job(self, job_id):
+        """Worker step for one job: submit if not yet submitted, persist the
+        progress_url immediately, then poll to completion. Restored jobs with
+        an existing progress_url skip straight to polling."""
         exp = self._jobs[job_id]
-        self.simulator.simulate(exp, poll_timeout_sec=self.poll_timeout_sec)
+        try:
+            if exp.status == "PENDING":
+                self.simulator.submit(exp, poll_timeout_sec=self.poll_timeout_sec)
+                # The backend owns a simulation now; make the progress_url
+                # durable before polling so a crash resumes the poll instead
+                # of creating a duplicate simulation.
+                self._checkpoint()
+            if exp.status in ("SUBMITTED", "POLLING"):
+                self.simulator.poll(exp, poll_timeout_sec=self.poll_timeout_sec)
+        except Exception as exc:  # noqa: BLE001
+            exp.error = f"{type(exc).__name__}: {exc}"
+            exp.status = "FAILED"
         return exp
 
     def _finalize(self, job_id):
@@ -228,24 +257,25 @@ class BacktestScheduler:
     def _checkpoint(self):
         if not self.checkpoint_path:
             return
-        self.updated_at = time.time()
-        data = {
-            "schema_version": self.SCHEMA_VERSION,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "submitted": self._submitted,
-            "running": [
-                self._jobs[job_id].to_dict() for job_id in self._running
-            ],
-            "completed": [
-                exp.to_dict() for exp in self._completed.values()
-            ],
-            "failed": [exp.to_dict() for exp in self._failed.values()],
-        }
-        tmp = self.checkpoint_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, self.checkpoint_path)
+        with self._checkpoint_lock:
+            self.updated_at = time.time()
+            data = {
+                "schema_version": self.SCHEMA_VERSION,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+                "submitted": self._submitted,
+                "running": [
+                    self._jobs[job_id].to_dict() for job_id in self._running
+                ],
+                "completed": [
+                    exp.to_dict() for exp in self._completed.values()
+                ],
+                "failed": [exp.to_dict() for exp in self._failed.values()],
+            }
+            tmp = self.checkpoint_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self.checkpoint_path)
         logger.info("CHECKPOINT_SAVED path=%s completed=%d failed=%d",
                     self.checkpoint_path, len(self._completed),
                     len(self._failed))
@@ -256,12 +286,38 @@ class BacktestScheduler:
         with open(self.checkpoint_path) as f:
             data = json.load(f)
         self._submitted = data.get("submitted", 0)
+        # Jobs added by the caller (agent) via add_jobs already carry the
+        # fresh Experiment objects; a checkpoint entry for the same expression
+        # must be merged into that object so the caller observes the outcome.
+        queued = {}
+        for job_id in self._queue:
+            expr = self._jobs[job_id].expression
+            queued.setdefault(expr, job_id)
         for edict in data.get("completed", []):
             exp = Experiment.from_dict(edict)
+            if exp.expression in queued:
+                # Merge onto the caller's object and drop it from the queue so
+                # it is never submitted again.
+                target_id = queued[exp.expression]
+                target = self._jobs[target_id]
+                self._restore_result(target, exp)
+                self._completed[target_id] = target
+                continue
             self._jobs[exp.id] = exp
             self._completed[exp.id] = exp
         for edict in data.get("failed", []):
             exp = Experiment.from_dict(edict)
+            if exp.expression in queued:
+                target_id = queued[exp.expression]
+                target = self._jobs[target_id]
+                self._restore_result(target, exp)
+                self._failed[target_id] = target
+                if "crash_mid_flight" in (exp.error or ""):
+                    # A previous resume already turned a mid-flight job into a
+                    # FAILED outcome; keep it out of the submission path even
+                    # if the process crashed again before checkpointing it.
+                    self._no_retry.add(exp.expression)
+                continue
             self._jobs[exp.id] = exp
             self._failed[exp.id] = exp
             if "crash_mid_flight" in (exp.error or ""):
@@ -270,29 +326,64 @@ class BacktestScheduler:
                 # the process crashed again before checkpointing it as such.
                 self._no_retry.add(exp.expression)
         for edict in data.get("running", []):
-            # Submitted to the backend but never finalized before the crash.
-            # Mark FAILED and forbid re-submission: retrying would create a
-            # duplicate simulation for the same expression.
             exp = Experiment.from_dict(edict)
-            self._jobs[exp.id] = exp
-            exp.status = "FAILED"
-            exp.error = (
-                "crash_mid_flight: simulation was submitted but never finalized"
-            )
-            self._failed[exp.id] = exp
-            self._no_retry.add(exp.expression)
-            logger.warning(
-                "BACKTEST_JOB_MIDFLIGHT job_id=%s expression=%s "
-                "marked failed, not re-submitted",
-                exp.id,
-                exp.expression[:60],
-            )
+            if exp.expression in queued:
+                target_id = queued[exp.expression]
+                target = self._jobs[target_id]
+                target.progress_url = exp.progress_url
+                target.alpha_id = exp.alpha_id
+                target.metrics = exp.metrics
+                self._queue.remove(target_id)
+                self._restore_running(target_id, target, exp)
+            else:
+                self._jobs[exp.id] = exp
+                self._restore_running(exp.id, exp, exp)
         logger.info(
             "SCHEDULER_RESUMED path=%s completed=%d failed=%d midflight=%d "
             "submitted=%d",
             self.checkpoint_path, len(self._completed), len(self._failed),
             len(self._no_retry), self._submitted,
         )
+
+    def _restore_running(self, job_id, target, snapshot):
+        """Route a restored in-flight job by its recoverable state:
+        - progress_url present -> continue polling the existing simulation
+        - PENDING, no url       -> the slot was reserved but the backend never
+                                   received a submit; re-submit (no new charge)
+        - anything else (legacy RUNNING / in-flight submit) -> cannot be
+          recovered; fail it and never submit the expression again."""
+        if snapshot.progress_url:
+            target.status = (
+                snapshot.status
+                if snapshot.status in ("SUBMITTED", "POLLING")
+                else "POLLING"
+            )
+            self._running.add(job_id)
+            logger.info(
+                "BACKTEST_JOB_RECOVERED job_id=%s expression=%s "
+                "resume=poll url=%s",
+                job_id, target.expression[:60], snapshot.progress_url,
+            )
+        elif snapshot.status == "PENDING":
+            target.status = "PENDING"
+            self._running.add(job_id)
+            logger.info(
+                "BACKTEST_JOB_RECOVERED job_id=%s expression=%s resume=submit",
+                job_id, target.expression[:60],
+            )
+        else:
+            target.status = "FAILED"
+            target.error = (
+                "crash_mid_flight: simulation was submitted but never finalized"
+            )
+            target.progress_url = snapshot.progress_url
+            self._failed[job_id] = target
+            self._no_retry.add(target.expression)
+            logger.warning(
+                "BACKTEST_JOB_MIDFLIGHT job_id=%s expression=%s "
+                "marked failed, not re-submitted",
+                job_id, target.expression[:60],
+            )
 
     # ---- introspection ----
 

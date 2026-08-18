@@ -313,8 +313,9 @@ class TestSchedulerMidFlight(unittest.TestCase):
         )
 
     def test_midflight_state_persisted_before_submit(self):
-        # The RUNNING job must be in the checkpoint at the moment the backend
-        # submit call executes, i.e. the checkpoint happens before submit.
+        # The in-flight job must be in the checkpoint at the moment the backend
+        # submit call executes, i.e. the checkpoint happens before submit and
+        # records the job as PENDING with no progress_url yet.
         class BlockingClient(FakeClient):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
@@ -346,13 +347,291 @@ class TestSchedulerMidFlight(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(len(data.get("running", [])), 1)
         self.assertEqual(data["running"][0]["expression"], "rank(f0)")
-        self.assertEqual(data["running"][0]["status"], "RUNNING")
+        self.assertEqual(data["running"][0]["status"], "PENDING")
+        self.assertIsNone(data["running"][0].get("progress_url"))
         self.assertEqual(data["submitted"], 1)
 
         client.release.set()
         worker.join(timeout=10)
         self.assertFalse(worker.is_alive())
         self.assertEqual(jobs[0].status, "DONE")
+        self.assertEqual(client.submissions, ["rank(f0)"])
+
+
+class TestExactlyOnceRecovery(unittest.TestCase):
+    """The submit/resume invariant: once the backend owns a simulation, a
+    crash must resume by polling the existing simulation (identified by the
+    persisted progress_url), never by POSTing /simulations again. budget
+    `submitted` is never re-minted across restarts."""
+
+    def _path(self, tmpdir):
+        return os.path.join(tmpdir, "jobs.json")
+
+    def _write_checkpoint(self, path, submitted, running=None,
+                          completed=None, failed=None):
+        import json
+
+        data = {
+            "schema_version": 1,
+            "submitted": submitted,
+            "running": [e.to_dict() for e in (running or [])],
+            "completed": [e.to_dict() for e in (completed or [])],
+            "failed": [e.to_dict() for e in (failed or [])],
+        }
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def _submitted_exp(self, expr, url):
+        exp = make_experiments([expr])[0]
+        exp.status = "SUBMITTED"
+        exp.progress_url = url
+        return exp
+
+    def _polling_exp(self, expr, url):
+        exp = self._submitted_exp(expr, url)
+        exp.status = "POLLING"
+        return exp
+
+    def _pending_exp(self, expr):
+        exp = make_experiments([expr])[0]
+        exp.status = "PENDING"
+        return exp
+
+    def _done_exp(self, expr):
+        exp = make_experiments([expr])[0]
+        exp.status = "DONE"
+        exp.metrics = {"sharpe": 1.0, "fitness": 1.0}
+        return exp
+
+    def _seed_url(self, client, expr, url):
+        client._expr_by_url[url] = expr
+
+    def test_crash_before_submit_allows_resubmit(self):
+        # A PENDING slot with no progress_url means the backend never received
+        # a submit: restart must submit it exactly once (no duplicate budget
+        # charge, no double submission).
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        self._write_checkpoint(path, submitted=1, running=[self._pending_exp(expr)])
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.submissions, [expr], "exactly one submit")
+        self.assertEqual(jobs[0].status, "DONE")
+        self.assertEqual(sched._submitted, 1, "slot charged once")
+
+    def test_submitted_job_resumes_with_poll_not_resubmit(self):
+        # Submit succeeded and the progress_url was persisted; crash. Restart
+        # must poll the existing simulation: zero POST /simulations.
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        url = "progress-7"
+        self._seed_url(FakeClient(), expr, url)
+        self._write_checkpoint(path, submitted=1,
+                               running=[self._submitted_exp(expr, url)])
+
+        client = FakeClient()
+        self._seed_url(client, expr, url)
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.submissions, [], "no re-submit after crash")
+        self.assertEqual(client.counter, 0)
+        self.assertEqual(jobs[0].status, "DONE")
+        self.assertEqual(jobs[0].progress_url, url)
+        self.assertEqual(jobs[0].metrics["sharpe"], 1.0)
+
+    def test_polling_job_resumes_with_poll(self):
+        # Crashed mid-poll with a persisted progress_url: keep polling.
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        url = "progress-3"
+        self._write_checkpoint(path, submitted=1,
+                               running=[self._polling_exp(expr, url)])
+
+        client = FakeClient()
+        self._seed_url(client, expr, url)
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.counter, 0, "poll only, no submit")
+        self.assertEqual(jobs[0].status, "DONE")
+        self.assertIsNotNone(jobs[0].metrics)
+
+    def test_done_job_never_resubmitted(self):
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        self._write_checkpoint(path, submitted=1,
+                               completed=[self._done_exp(expr)])
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.counter, 0)
+        self.assertEqual(jobs[0].status, "DONE")
+
+    def test_partial_concurrency_recovers_mixed_states(self):
+        # Some jobs finished, one was submitted, one only reserved a slot:
+        # restart polls the submitted one, re-submits the reserved one, runs
+        # the untouched ones, and never re-runs the finished ones.
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        done_expr, sub_expr, pend_expr, fresh1, fresh2 = (
+            "rank(f0)", "rank(f1)", "rank(f2)", "rank(f3)", "rank(f4)")
+        url = "progress-9"
+        self._write_checkpoint(
+            path,
+            submitted=4,
+            running=[self._submitted_exp(sub_expr, url),
+                     self._pending_exp(pend_expr)],
+            completed=[self._done_exp(done_expr)],
+        )
+
+        client = FakeClient()
+        self._seed_url(client, sub_expr, url)
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=4, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([done_expr, sub_expr, pend_expr, fresh1, fresh2])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(
+            client.submissions,
+            [pend_expr, fresh1, fresh2],
+            "submitted job is polled, never re-submitted",
+        )
+        by_expr = {j.expression: j.status for j in jobs}
+        self.assertEqual(by_expr[done_expr], "DONE")
+        self.assertEqual(by_expr[sub_expr], "DONE")
+        self.assertEqual(by_expr[pend_expr], "DONE")
+        self.assertEqual(by_expr[fresh1], "DONE")
+        self.assertEqual(by_expr[fresh2], "DONE")
+
+    def test_budget_never_exceeded_across_crash(self):
+        # budget=4, 3 slots already consumed before the crash. Restart may
+        # submit at most one more job, even though a fresh submission + the
+        # polled job both complete.
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        sub_expr, fresh = "rank(f0)", "rank(f1)"
+        url = "progress-5"
+        self._write_checkpoint(
+            path,
+            submitted=3,
+            running=[self._submitted_exp(sub_expr, url)],
+            completed=[self._done_exp("rank(f9)"), self._done_exp("rank(f8)")],
+        )
+
+        client = FakeClient()
+        self._seed_url(client, sub_expr, url)
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=4, budget=4,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([sub_expr, fresh, "rank(f2)", "rank(f3)"])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.counter, 1, "one fresh slot left")
+        self.assertEqual(client.submissions, [fresh])
+        by_expr = {j.expression: j.status for j in jobs}
+        self.assertEqual(by_expr[sub_expr], "DONE", "polled, not re-submitted")
+        self.assertEqual(by_expr[fresh], "DONE")
+        self.assertEqual(by_expr["rank(f2)"], "SKIPPED")
+        self.assertEqual(by_expr["rank(f3)"], "SKIPPED")
+        self.assertLessEqual(sched._submitted, 4)
+
+    def test_progress_url_persisted_before_poll(self):
+        # Real window: submit returns, then the scheduler must checkpoint the
+        # progress_url before polling. While the worker is blocked inside
+        # poll_progress the checkpoint already carries the recoverable URL.
+        import json
+
+        class PollBlockingClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.poll_entered = threading.Event()
+                self.release = threading.Event()
+
+            def poll_progress(self, progress_url, timeout_sec=900):
+                self.poll_entered.set()
+                self.release.wait(timeout=5)
+                return super().poll_progress(progress_url, timeout_sec=timeout_sec)
+
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        client = PollBlockingClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=1, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments(["rank(f0)"])
+        sched.add_jobs(jobs)
+
+        worker = threading.Thread(target=sched.run)
+        worker.start()
+        self.assertTrue(client.poll_entered.wait(timeout=5))
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(len(data.get("running", [])), 1)
+        self.assertEqual(data["running"][0]["status"], "SUBMITTED")
+        self.assertEqual(data["running"][0]["progress_url"], "progress-1")
+        self.assertEqual(data["submitted"], 1)
+
+        client.release.set()
+        worker.join(timeout=10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(jobs[0].status, "DONE")
+        self.assertEqual(client.counter, 1, "exactly one submit")
+
+    def test_validation_job_resumes_with_poll(self):
+        # Validation simulations ride the same scheduler state machine, so a
+        # validation job that crashed after submit must also be resumed by
+        # polling rather than re-submitted.
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(ts_mean(close, 10))"
+        url = "progress-21"
+        validation_job = self._submitted_exp(expr, url)
+        validation_job.mutation = "validation-window-up"
+        self._write_checkpoint(path, submitted=1, running=[validation_job])
+
+        client = FakeClient()
+        self._seed_url(client, expr, url)
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        jobs[0].mutation = "validation-window-up"
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.counter, 0)
+        self.assertEqual(jobs[0].status, "DONE")
+        self.assertEqual(jobs[0].mutation, "validation-window-up")
 
 
 if __name__ == "__main__":

@@ -14,21 +14,35 @@ class Simulator:
         self.max_concurrent = max_concurrent
         self.poll_timeout_sec = poll_timeout_sec
 
+    def submit(self, experiment, poll_timeout_sec=None):
+        """Create the remote simulation and persist its progress URL on the
+        experiment. The caller (scheduler) checkpoint()s right after this
+        returns so a crash can resume polling instead of re-submitting."""
+        experiment.status = "PENDING"
+        url = self.client.submit_simulation(
+            experiment.expression, experiment.settings
+        )
+        experiment.progress_url = url
+        experiment.status = "SUBMITTED"
+
+    def poll(self, experiment, poll_timeout_sec=None):
+        """Continue an already-submitted simulation and fetch its metrics."""
+        experiment.status = "POLLING"
+        alpha_id = self.client.poll_progress(
+            experiment.progress_url,
+            timeout_sec=poll_timeout_sec or self.poll_timeout_sec,
+        )
+        payload = self.client.get_alpha(alpha_id)
+        experiment.alpha_id = alpha_id
+        experiment.metrics = _extract_metrics(payload)
+        experiment.status = "DONE"
+
     def simulate(self, experiment, poll_timeout_sec=None):
         """Execute exactly one simulation and update the experiment in place."""
-        experiment.status = "RUNNING"
+        experiment.status = "PENDING"
         try:
-            progress_url = self.client.submit_simulation(
-                experiment.expression, experiment.settings
-            )
-            alpha_id = self.client.poll_progress(
-                progress_url,
-                timeout_sec=poll_timeout_sec or self.poll_timeout_sec,
-            )
-            payload = self.client.get_alpha(alpha_id)
-            experiment.alpha_id = alpha_id
-            experiment.metrics = _extract_metrics(payload)
-            experiment.status = "DONE"
+            self.submit(experiment, poll_timeout_sec=poll_timeout_sec)
+            self.poll(experiment, poll_timeout_sec=poll_timeout_sec)
         except Exception as exc:  # noqa: BLE001
             experiment.error = f"{type(exc).__name__}: {exc}"
             experiment.status = "FAILED"
