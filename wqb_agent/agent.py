@@ -383,6 +383,16 @@ class Agent:
                 round_no,
                 fields_used=rec_obj.fields_used,
             )
+            # Robustness validation confirms the high-signal hit: it becomes
+            # strong support for the belief on these fields.
+            self.memory.record_evidence(
+                self._belief_key_of(rec),
+                self._belief_claim_of(rec),
+                "support",
+                round_no,
+                source=self._validation_source(rec, round_no),
+                kind="validated_high_signal",
+            )
             logger.info(
                 "VALIDATION_FINISHED round=%d expression=%s stable=True sims=%d",
                 round_no, rec_obj.expression[:60], sims,
@@ -395,6 +405,17 @@ class Agent:
             self.memory.archive(
                 "unreproducible_high_signal", rec_obj.expression, round_no
             )
+            # Validation failure is robustness-negative evidence: the belief
+            # that these fields carry a high signal is contradicted, not just
+            # dropped into garbage.
+            self.memory.record_evidence(
+                self._belief_key_of(rec),
+                self._belief_claim_of(rec),
+                "contradict",
+                round_no,
+                source=self._validation_source(rec, round_no),
+                kind="validation_failure",
+            )
             logger.info(
                 "VALIDATION_FINISHED round=%d expression=%s stable=False sims=%d",
                 round_no, rec_obj.expression[:60], sims,
@@ -403,6 +424,29 @@ class Agent:
                 f"  [rejected] {rec_obj.expression[:60]} "
                 f"unreproducible under perturbation"
             )
+
+    @staticmethod
+    def _belief_key_of(rec):
+        fields = sorted(rec.get("fields_used") or [])
+        label = ",".join(fields) if fields else "unknown"
+        return f"fields:{label}"
+
+    @staticmethod
+    def _belief_claim_of(rec):
+        fields = rec.get("fields_used") or []
+        field_label = ",".join(fields) if fields else "?"
+        return f"Fields [{field_label}] carry predictive signal for forward returns"
+
+    @staticmethod
+    def _validation_source(rec, round_no):
+        return {
+            "experiment_id": f"{rec.get('id')}-validation",
+            "round": round_no,
+            "expression": rec.get("expression"),
+            "lineage": list(rec.get("lineage") or []),
+            "fields": list(rec.get("fields_used") or []),
+            "mutation": "validation",
+        }
 
     @staticmethod
     def _perturb_result(exp):

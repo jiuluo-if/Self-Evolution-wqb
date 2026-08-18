@@ -41,6 +41,7 @@ class ExperienceMemory:
         self.current_best = None
         self.submission_pool = []  # list of AlphaRecord dicts
         self.lessons = []  # tier: "long" | "short"
+        self.beliefs = []  # Claim -> {support, contradiction} -> confidence
         self.avoid = []
         self.next = []
         self.active_lineages = []  # {expression, lineage, attempts, best_score, last_round}
@@ -66,6 +67,7 @@ class ExperienceMemory:
         self.current_best = data.get("current_best")
         self.submission_pool = data.get("submission_pool", [])
         self.lessons = data.get("lessons", [])
+        self.beliefs = data.get("beliefs", [])
         self.avoid = data.get("avoid", [])
         self.next = data.get("next", [])
         self.active_lineages = data.get("active_lineages", [])
@@ -79,6 +81,14 @@ class ExperienceMemory:
             lesson["source_rounds"] = set(rounds)
             roots = lesson.get("lineage_roots") or []
             lesson["lineage_roots"] = set(roots)
+        for belief in self.beliefs:
+            belief["support_lineage_roots"] = set(
+                belief.get("support_lineage_roots") or []
+            )
+            belief["contradiction_lineage_roots"] = set(
+                belief.get("contradiction_lineage_roots") or []
+            )
+            belief["source_rounds"] = set(belief.get("source_rounds") or [])
         return self
 
     def save(self):
@@ -90,6 +100,7 @@ class ExperienceMemory:
             "current_best": self.current_best,
             "submission_pool": self.submission_pool,
             "lessons": self.lessons,
+            "beliefs": self.beliefs,
             "avoid": self.avoid,
             "next": self.next,
             "active_lineages": self.active_lineages,
@@ -142,6 +153,156 @@ class ExperienceMemory:
         self._append_evidence(entry, source)
         entry["tier"] = self._tier_for(entry)
         self.lessons.append(entry)
+        return entry
+
+    # ---- beliefs (Claim -> Supporting + Contradicting evidence -> Confidence) ----
+
+    def get_belief(self, belief_key):
+        for belief in self.beliefs:
+            if belief["belief_key"] == belief_key:
+                return belief
+        return None
+
+    def record_evidence(
+        self,
+        belief_key,
+        claim,
+        polarity,
+        source_round,
+        source=None,
+        kind=None,
+    ):
+        """Record one experiment's evidence about a research belief.
+
+        polarity:
+          "support"    - a valid RESEARCH result favors the claim
+          "contradict" - a valid RESEARCH result opposes the claim
+          "pending"    - observed but not strong enough to count yet (e.g. a
+                         high-signal hit awaiting robustness validation)
+
+        Invariants:
+        - an experiment_id contributes to a claim at most once (replay-safe)
+        - repeated confirmations along ONE lineage root add a single
+          independent line of evidence, so confidence does not creep up from
+          parameter micro-tuning on the same lineage
+        - contradiction raises contradiction_count and lowers confidence;
+          support never overwrites the contradiction history
+        """
+        belief = self._get_or_create_belief(belief_key, claim)
+        if source:
+            exp_id = source.get("experiment_id")
+            if exp_id and any(
+                e.get("experiment_id") == exp_id
+                and e.get("polarity") == polarity
+                for e in belief["evidence_log"]
+            ):
+                return belief
+
+        root = self._lineage_root(source) if source else None
+        belief["source_rounds"].add(source_round)
+        if polarity == "support":
+            belief["support_count"] += 1
+            if root:
+                belief["support_lineage_roots"].add(root)
+        elif polarity == "contradict":
+            belief["contradiction_count"] += 1
+            if root:
+                belief["contradiction_lineage_roots"].add(root)
+
+        if source:
+            log = belief.setdefault("evidence_log", [])
+            log.insert(
+                0,
+                {
+                    "experiment_id": source.get("experiment_id"),
+                    "polarity": polarity,
+                    "kind": kind,
+                    "round": source.get("round") or source_round,
+                    "lineage_root": root,
+                    "expression": source.get("expression"),
+                    "fields": list(source.get("fields") or []),
+                },
+            )
+            del log[30:]  # keep contradiction history, bound the log
+
+        belief["confidence"] = self._belief_confidence(belief)
+        belief["tier"] = self._belief_tier_for(belief)
+        belief["updated"] = time.time()
+        return belief
+
+    def _get_or_create_belief(self, belief_key, claim):
+        belief = self.get_belief(belief_key)
+        if belief is not None:
+            return belief
+        entry = {
+            "id": uuid.uuid4().hex[:8],
+            "belief_key": belief_key,
+            "claim": claim,
+            "polarity": "support",  # direction the claim asserts
+            "support_count": 0,
+            "contradiction_count": 0,
+            "support_lineage_roots": set(),
+            "contradiction_lineage_roots": set(),
+            "source_rounds": set(),
+            "evidence_log": [],
+            "confidence": 0.5,
+            "tier": "short",
+            "created": time.time(),
+            "updated": time.time(),
+        }
+        self.beliefs.append(entry)
+        return entry
+
+    @staticmethod
+    def _belief_confidence(belief):
+        """Transparent confidence: an unknown claim sits at 0.5; each
+        independent supporting lineage adds +0.2, each independent
+        contradicting lineage subtracts 0.2."""
+        s = len(belief["support_lineage_roots"])
+        c = len(belief["contradiction_lineage_roots"])
+        return max(0.05, min(0.95, 0.5 + 0.2 * (s - c)))
+
+    def _belief_tier_for(self, belief):
+        """Long-term requires enough independent support across rounds AND no
+        contradiction as strong as the support. Strong contradiction demotes a
+        belief back to short-term."""
+        s = len(belief["support_lineage_roots"])
+        c = len(belief["contradiction_lineage_roots"])
+        rounds = belief.get("source_rounds") or set()
+        if (
+            s >= self.promote_evidence
+            and len(rounds) >= 2
+            and s >= 2
+            and not (c >= s)
+        ):
+            return "long"
+        return "short"
+
+    def add_avoid(self, direction, reason, source_round, source=None):
+        for item in self.avoid:
+            if item["direction"] == direction:
+                item["support_count"] = item.get("support_count", 0) + 1
+                item["reason"] = reason
+                item["source_round"] = source_round
+                item["last_seen"] = source_round
+                item["updated"] = time.time()
+                if source:
+                    log = item.setdefault("evidence_log", [])
+                    log.insert(0, dict(source))
+                    del log[5:]
+                return item
+        entry = {
+            "id": uuid.uuid4().hex[:8],
+            "direction": direction,
+            "reason": reason,
+            "source_round": source_round,
+            "support_count": 1,
+            "last_seen": source_round,
+            "evidence_log": [dict(source)] if source else [],
+            "created": time.time(),
+            "updated": time.time(),
+        }
+        self.avoid.append(entry)
         return entry
 
     @staticmethod
@@ -392,6 +553,7 @@ class ExperienceMemory:
         """Read-only view of reliable long-term knowledge."""
         return {
             "lessons": [l for l in self.lessons if l.get("tier") == "long"],
+            "beliefs": [b for b in self.beliefs if b.get("tier") == "long"],
             "avoid": list(self.avoid),
         }
 

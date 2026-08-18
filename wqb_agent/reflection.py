@@ -1,5 +1,5 @@
 from .diversity import is_redundant
-from .failures import classify_error, is_research_relevant
+from .failures import FailureKind, classify_error, is_research_relevant
 from .state import AlphaRecord, score_of
 
 
@@ -146,8 +146,27 @@ class Reflector:
             if not is_research_relevant(kind):
                 # Infrastructure / auth / rate-limit / timeout failures carry no
                 # information about the hypothesis; keep them out of research
-                # memory and garbage.
+                # memory and garbage. They never count as support or
+                # contradiction for any belief.
                 return
+            if kind in (FailureKind.SYNTAX, FailureKind.DATA):
+                # Expression construction / data failures teach how to build
+                # the expression, never whether the economic hypothesis is
+                # wrong. They stay in avoid as construction lessons and do not
+                # enter belief accounting.
+                self.memory.add_avoid(
+                    self._direction_key(exp),
+                    self._diagnose_error(exp),
+                    round_no,
+                    source=self._source_of(exp),
+                )
+                if self.memory.is_avoided(self._direction_key(exp)):
+                    self.memory.archive(
+                        "repeat_fail", self._direction_key(exp), round_no
+                    )
+                return
+            # A valid RESEARCH failure (low sharpe / failed checks with metrics)
+            # is financial negative evidence for the belief on these fields.
             self.memory.add_avoid(
                 self._direction_key(exp),
                 self._diagnose_error(exp),
@@ -158,6 +177,14 @@ class Reflector:
                 self.memory.archive(
                     "repeat_fail", self._direction_key(exp), round_no
                 )
+            self.memory.record_evidence(
+                self._belief_key(exp),
+                self._belief_claim(exp),
+                "contradict",
+                round_no,
+                source=self._source_of(exp),
+                kind="financial_negative",
+            )
             return
 
         metrics = exp.metrics or {}
@@ -173,6 +200,14 @@ class Reflector:
                 confidence=0.7,
                 source=self._source_of(exp),
             )
+            self.memory.record_evidence(
+                self._belief_key(exp),
+                self._belief_claim(exp),
+                "support",
+                round_no,
+                source=self._source_of(exp),
+                kind="success",
+            )
         elif verdict["label"] == "SUSPICIOUS":
             self.memory.add_lesson(
                 f"Fields [{field_label}] produced an unusually high signal "
@@ -182,6 +217,17 @@ class Reflector:
                 confidence=0.2,
                 source=self._source_of(exp),
             )
+            # Pending: a high-signal hit is not yet strong support. It only
+            # counts once robustness validation confirms it (or becomes a
+            # contradiction when validation rejects it).
+            self.memory.record_evidence(
+                self._belief_key(exp),
+                self._belief_claim(exp),
+                "pending",
+                round_no,
+                source=self._source_of(exp),
+                kind="suspicious_high_signal",
+            )
         elif verdict["label"] == "PROMISING":
             self.memory.add_lesson(
                 f"Fields [{field_label}] show weak positive signal; worth iterating.",
@@ -189,6 +235,14 @@ class Reflector:
                 evidence=1,
                 confidence=0.3,
                 source=self._source_of(exp),
+            )
+            self.memory.record_evidence(
+                self._belief_key(exp),
+                self._belief_claim(exp),
+                "support",
+                round_no,
+                source=self._source_of(exp),
+                kind="promising",
             )
             self.memory.add_next(
                 f"Iterate on [{field_label}] with smoothing / neutralization variants.",
@@ -203,13 +257,16 @@ class Reflector:
                 round_no,
                 source=self._source_of(exp),
             )
-            self.memory.add_lesson(
-                f"Direction on [{field_label}] has no predictive power "
-                f"(Sharpe {metrics.get('sharpe')}).",
+            # Financial negative evidence: a valid research result opposing the
+            # belief on these fields. Not a lesson to be text-merged with
+            # successes (token similarity cannot decide polarity).
+            self.memory.record_evidence(
+                self._belief_key(exp),
+                self._belief_claim(exp),
+                "contradict",
                 round_no,
-                evidence=2,
-                confidence=0.4,
                 source=self._source_of(exp),
+                kind="financial_negative",
             )
 
         turnover = metrics.get("turnover")
@@ -286,6 +343,20 @@ class Reflector:
     @staticmethod
     def _direction_key(exp):
         return exp.expression[:80]
+
+    @staticmethod
+    def _belief_key(exp):
+        """Explicit identity for a research belief (field-family). Polarity is
+        decided by the outcome, never by text similarity between claims."""
+        fields = sorted(exp.fields_used)
+        label = ",".join(fields) if fields else "unknown"
+        return f"fields:{label}"
+
+    @staticmethod
+    def _belief_claim(exp):
+        fields = exp.fields_used
+        field_label = ",".join(fields) if fields else "?"
+        return f"Fields [{field_label}] carry predictive signal for forward returns"
 
     def _update_best(self, results):
         """Best may only come from experiments that fully passed WQB checks and

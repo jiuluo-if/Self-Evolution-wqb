@@ -245,6 +245,216 @@ class TestValidationRobustness(unittest.TestCase):
         self.assertFalse(stable)
 
 
+class TestResearchInvariant(unittest.TestCase):
+    """Bidirectional belief accounting: Claim -> supporting + contradicting
+    evidence -> confidence. Support strengthens, contradiction weakens,
+    same-lineage repeats do not inflate, infra/syntax never contradict."""
+
+    @staticmethod
+    def _source(exp_id, round_no, lineage=None, expression="rank(x)"):
+        return {
+            "experiment_id": exp_id,
+            "round": round_no,
+            "expression": expression,
+            "lineage": list(lineage or []),
+        }
+
+    def _belief(self, memory):
+        return memory.get_belief("fields:returns")
+
+    def test_single_success_is_short_term(self):
+        memory = _fresh_memory()
+        memory.record_evidence(
+            "fields:returns", "Fields [returns] are predictive",
+            "support", 1, source=self._source("e1", 1),
+        )
+        b = self._belief(memory)
+        self.assertEqual(b["support_count"], 1)
+        self.assertEqual(b["tier"], "short")
+
+    def test_same_lineage_repeats_do_not_escalate(self):
+        memory = _fresh_memory()
+        for r in (1, 2, 3):
+            memory.record_evidence(
+                "fields:returns", "claim", "support", r,
+                source=self._source(
+                    f"e{r}", r, lineage=["rootX", "mid", "parent"]
+                ),
+            )
+        b = self._belief(memory)
+        self.assertEqual(b["support_count"], 3)
+        self.assertEqual(len(b["support_lineage_roots"]), 1)
+        self.assertEqual(b["confidence"], 0.7)  # one line, no creep
+        self.assertEqual(b["tier"], "short")
+
+    def test_two_independent_lineages_raise_confidence(self):
+        memory = _fresh_memory()
+        memory.record_evidence(
+            "fields:returns", "claim", "support", 1,
+            source=self._source("e1", 1, lineage=["rootA"]),
+        )
+        self.assertEqual(self._belief(memory)["confidence"], 0.7)
+        memory.record_evidence(
+            "fields:returns", "claim", "support", 2,
+            source=self._source("e2", 2, lineage=["rootB"]),
+        )
+        b = self._belief(memory)
+        self.assertEqual(len(b["support_lineage_roots"]), 2)
+        self.assertGreater(b["confidence"], 0.7)
+
+    def test_independent_contradiction_lowers_confidence(self):
+        memory = _fresh_memory()
+        memory.record_evidence(
+            "fields:returns", "claim", "support", 1,
+            source=self._source("e1", 1, lineage=["rootA"]),
+        )
+        before = self._belief(memory)["confidence"]
+        memory.record_evidence(
+            "fields:returns", "claim", "contradict", 2,
+            source=self._source("e2", 2, lineage=["rootB"]),
+        )
+        b = self._belief(memory)
+        self.assertEqual(b["contradiction_count"], 1)
+        self.assertLess(b["confidence"], before)
+
+    def test_strong_contradiction_demotes_long_to_short(self):
+        memory = ExperienceMemory(
+            state_dir=tempfile.mkdtemp(), promote_evidence=2
+        )
+        for i, r in enumerate((1, 2)):
+            memory.record_evidence(
+                "fields:returns", "claim", "support", r,
+                source=self._source(f"s{i}", r, lineage=[f"rootS{i}"]),
+            )
+        self.assertEqual(self._belief(memory)["tier"], "long")
+        for i, r in enumerate((3, 4)):
+            memory.record_evidence(
+                "fields:returns", "claim", "contradict", r,
+                source=self._source(f"c{i}", r, lineage=[f"rootC{i}"]),
+            )
+        b = self._belief(memory)
+        self.assertEqual(len(b["contradiction_lineage_roots"]), 2)
+        self.assertEqual(b["tier"], "short")  # c >= s -> demoted
+
+    def test_same_experiment_replay_does_not_double_count(self):
+        memory = _fresh_memory()
+        src = self._source("e1", 1, lineage=["rootA"])
+        memory.record_evidence(
+            "fields:returns", "claim", "support", 1, source=src,
+        )
+        memory.record_evidence(
+            "fields:returns", "claim", "support", 1, source=src,
+        )
+        b = self._belief(memory)
+        self.assertEqual(b["support_count"], 1)
+        self.assertEqual(len(b["support_lineage_roots"]), 1)
+
+    def test_persistence_preserves_evidence_accounting(self):
+        memory = _fresh_memory()
+        memory.record_evidence(
+            "fields:returns", "claim", "support", 1,
+            source=self._source("e1", 1, lineage=["rootA"]),
+        )
+        memory.record_evidence(
+            "fields:returns", "claim", "support", 2,
+            source=self._source("e2", 2, lineage=["rootB"]),
+        )
+        memory.record_evidence(
+            "fields:returns", "claim", "contradict", 3,
+            source=self._source("e3", 3, lineage=["rootC"]),
+        )
+        memory.save()
+        loaded = ExperienceMemory(state_dir=memory.state_dir).load()
+        b = loaded.get_belief("fields:returns")
+        self.assertEqual(b["support_count"], 2)
+        self.assertEqual(b["contradiction_count"], 1)
+        self.assertEqual(b["support_lineage_roots"], {"rootA", "rootB"})
+        self.assertEqual(b["contradiction_lineage_roots"], {"rootC"})
+        self.assertEqual(len(b["source_rounds"]), 3)
+        self.assertEqual(b["confidence"], 0.7)
+
+    def test_infra_failure_changes_no_belief(self):
+        memory = _fresh_memory()
+        reflector = Reflector(memory)
+        e = Experiment(1, "h", "rank(returns)", {}, ["returns"])
+        e.status = "FAILED"
+        e.error = "WQBSimulationError: network error: Connection refused"
+        reflector.reflect(1, {"tags": ["return"]}, [e])
+        self.assertEqual(len(memory.beliefs), 0)
+
+    def test_syntax_failure_is_not_contradiction(self):
+        memory = _fresh_memory()
+        reflector = Reflector(memory)
+        e = Experiment(1, "h", "badfield(x)", {}, ["x"])
+        e.status = "FAILED"
+        e.error = "WQBRejectedError: Simulation rejected (422): invalid expression"
+        reflector.reflect(1, {"tags": ["return"]}, [e])
+        self.assertEqual(len(memory.beliefs), 0)
+        self.assertEqual(len(memory.avoid), 1)  # construction lesson kept
+
+    def test_reflection_records_support_and_contradiction_on_same_belief(self):
+        memory = _fresh_memory()
+        reflector = Reflector(memory)
+        ok = _done_experiment(
+            "rank(ts_mean(returns, 5))",
+            {"sharpe": 1.2, "fitness": 1.2, "turnover": 0.3,
+             "checks": [{"name": "x", "pass": True}], "passed": True},
+            ["returns"],
+        )
+        reflector.reflect(1, {"tags": ["return"]}, [ok])
+        bad = _done_experiment(
+            "rank(close)",
+            {"sharpe": 0.1, "fitness": 0.1, "turnover": 1.8,
+             "checks": [{"name": "x", "pass": True}], "passed": True},
+            ["returns"],
+        )
+        reflector.reflect(1, {"tags": ["return"]}, [bad])
+        b = memory.get_belief("fields:returns")
+        self.assertIsNotNone(b)
+        self.assertEqual(b["support_count"], 1)
+        self.assertEqual(b["contradiction_count"], 1)
+        self.assertEqual(b["confidence"], 0.5)
+
+    def test_validation_failure_contradicts_high_signal_claim(self):
+        memory = _fresh_memory()
+        tmpdir = tempfile.mkdtemp()
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["agent"]["state_dir"] = tmpdir
+        agent = AgentForTest(config, FakeClient())
+        rec = AlphaRecord(
+            expression="rank(ts_mean(returns, 5))",
+            metrics={"sharpe": 3.0, "fitness": 3.0},
+            fields_used=["returns"],
+            lineage=["rank(returns)"],
+            round_no=1,
+            hypothesis_id="h",
+        ).to_dict()
+        agent._apply_validation(rec, stable=False, round_no=1, sims=3)
+        b = agent.memory.get_belief("fields:returns")
+        self.assertEqual(b["contradiction_count"], 1)
+        self.assertEqual(b["support_count"], 0)
+        self.assertEqual(b["evidence_log"][0]["kind"], "validation_failure")
+
+    def test_validation_success_supports_high_signal_claim(self):
+        memory = _fresh_memory()
+        tmpdir = tempfile.mkdtemp()
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["agent"]["state_dir"] = tmpdir
+        agent = AgentForTest(config, FakeClient())
+        rec = AlphaRecord(
+            expression="rank(ts_mean(returns, 5))",
+            metrics={"sharpe": 3.0, "fitness": 3.0},
+            fields_used=["returns"],
+            lineage=["rank(returns)"],
+            round_no=1,
+            hypothesis_id="h",
+        ).to_dict()
+        agent._apply_validation(rec, stable=True, round_no=1, sims=3)
+        b = agent.memory.get_belief("fields:returns")
+        self.assertEqual(b["support_count"], 1)
+        self.assertEqual(b["evidence_log"][0]["kind"], "validated_high_signal")
+
+
 class TestNoChecksUnknown(unittest.TestCase):
     def test_empty_checks_never_counts_as_success(self):
         memory = _fresh_memory()
