@@ -205,6 +205,9 @@ class CandidateBuilder:
                     "falsification_variant": self._is_falsification(
                         family, sign
                     ),
+                    "field_discovery_reason": self._field_discovery_reason(
+                        fields[0]
+                    ),
                     "mutation": "explore",
                     "parent": None,
                     "lineage": [],
@@ -309,6 +312,9 @@ class CandidateBuilder:
             cand["expected_direction"] = ctx["expected_direction"]
             cand["expected_horizon_days"] = ctx["expected_horizon_days"]
             cand["falsification_variant"] = False
+            cand["field_discovery_reason"] = self._field_discovery_reason(
+                field_meta.get(primary)
+            )
             cand["mutation"] = mutation
             return cand
 
@@ -424,6 +430,24 @@ class CandidateBuilder:
         if not matches:
             return None
         return int(matches[-1].group(2))
+
+    @staticmethod
+    def _field_discovery_reason(field):
+        """Compact, interpretable summary of why a real field was selected.
+        Only a reference to the discovery evidence; the full field_match is
+        not duplicated into the candidate."""
+        if not isinstance(field, dict):
+            return None
+        fm = field.get("field_match")
+        if not isinstance(fm, dict):
+            return None
+        return {
+            "dataset": field.get("dataset"),
+            "semantic_concept": fm.get("semantic_concept"),
+            "matched_terms": list(fm.get("matched_terms") or []),
+            "semantic_score": fm.get("semantic_score"),
+            "match_score": fm.get("total_score"),
+        }
 
     @staticmethod
     def _semantic_alt_field(expr, primary, field_ids, field_meta):

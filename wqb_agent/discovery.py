@@ -68,6 +68,9 @@ class FieldDiscovery:
         self._cache = {}  # (dataset_id, limit, offset) -> cached page payload
         self._budget = None
         self._calls = 0
+        # Outcome of the last discover() call, so callers can tell an API
+        # infrastructure failure apart from a genuine "no matching field".
+        self.last_outcome = None
 
     def reset_budget(self, budget):
         """Per-round cap on new field-discovery API requests (0 = unlimited)."""
@@ -75,6 +78,10 @@ class FieldDiscovery:
         self._calls = 0
 
     def _page(self, dataset_id, limit, offset):
+        # The cache key carries the dataset identity: fields cached for
+        # dataset A are never reused for dataset B. A cache hit reuses the
+        # raw API payload but does not mint new research evidence, and it
+        # does not consume Field API budget.
         key = (dataset_id, limit, offset)
         cached = self._cache.get(key)
         if cached is not None:
@@ -89,6 +96,9 @@ class FieldDiscovery:
         return results, count
 
     def categorize_hypothesis(self, hypothesis):
+        """Category ranking is ordering/fallback metadata only. It never
+        decides which datasets a hypothesis is allowed to use; the research
+        boundary is hypothesis.datasets."""
         text = hypothesis.get("statement", "")
         tags = hypothesis.get("tags", [])
         combined = " ".join([text] + list(tags)).lower()
@@ -103,7 +113,75 @@ class FieldDiscovery:
             scores.keys(), key=lambda c: (scores[c], CATEGORY_VALUE[c]), reverse=True
         )
 
-    def _scored_fields(self, dataset_id, keywords, need, seen):
+    @staticmethod
+    def _category_of(dataset_id):
+        for category, datasets in DATASET_CATEGORIES.items():
+            if dataset_id in datasets:
+                return category
+        return None
+
+    def _datasets_for(self, hypothesis):
+        """The dataset boundary for this hypothesis.
+
+        hypothesis.datasets is an allowlist: Discovery never queries a
+        dataset outside it. Cross-dataset exploration requires an explicit
+        new hypothesis / dataset variant, never silent widening by
+        Discovery. Without a declared allowlist (legacy dicts) the category
+        keywords derive the boundary as a fallback.
+        """
+        declared = [d for d in (hypothesis.get("datasets") or []) if d]
+        if declared:
+            priority = self.categorize_hypothesis(hypothesis)
+            rank = {cat: i for i, cat in enumerate(priority)}
+
+            def sort_key(dataset_id):
+                category = self._category_of(dataset_id)
+                return (rank.get(category, len(priority)), category or "", dataset_id)
+
+            return sorted(declared, key=sort_key)
+        priority = self.categorize_hypothesis(hypothesis)
+        datasets = []
+        for category in priority:
+            for dataset_id in DATASET_CATEGORIES[category]:
+                if dataset_id not in datasets:
+                    datasets.append(dataset_id)
+        return datasets
+
+    @staticmethod
+    def _tokenize(texts, limit):
+        ordered = []
+        seen = set()
+        for text in texts:
+            for piece in re.split(r"[^a-z0-9]+", text.lower()):
+                if len(piece) > 2 and piece not in seen and piece not in _STOPWORDS:
+                    seen.add(piece)
+                    ordered.append(piece)
+                    if len(ordered) >= limit:
+                        return ordered
+        return ordered[:limit]
+
+    def _semantic_keywords(self, hypothesis, limit=10):
+        """WHAT economic meaning a field must have. These words carry the
+        highest research weight and are kept separate from general keywords
+        so a statement-word coincidence cannot outrank a real meaning match."""
+        semantics = (hypothesis.get("field_semantics") or {}).get("primary")
+        if not semantics:
+            return []
+        texts = [
+            str(semantics.get("concept") or ""),
+            str(semantics.get("description") or ""),
+        ]
+        return self._tokenize(texts, limit)
+
+    def _general_keywords(self, hypothesis, limit=6):
+        texts = [str(hypothesis.get("statement") or "")] + [
+            str(t) for t in (hypothesis.get("tags") or [])
+        ]
+        return self._tokenize(texts, limit)
+
+    def _scored_fields(
+        self, dataset_id, semantic_keywords, general_keywords, concept, need, seen
+    ):
         ranked = []
         offset = 0
         total = None
@@ -118,62 +196,89 @@ class FieldDiscovery:
             for field in results:
                 if field.get("id") in seen:
                     continue
-                score = self._score_field(field, keywords)
-                if score > 0:
-                    ranked.append((score, field))
+                info = self._score_field(
+                    field, semantic_keywords, general_keywords, concept
+                )
+                if info is None:
+                    continue
+                # A research contract states WHAT meaning a field must carry.
+                # A field id that merely happens to contain a keyword is
+                # auxiliary evidence, never a semantic match. Without a
+                # semantic match (name/description) the field is not a
+                # candidate primary field; a general keyword hit does not
+                # rescue it.
+                if semantic_keywords and info["semantic_score"] <= 0:
+                    continue
+                ranked.append(info)
             offset += len(results)
             if not results or (total and offset >= total) or len(ranked) >= need:
                 break
-        ranked.sort(key=lambda x: -x[0])
+        ranked.sort(
+            key=lambda info: (info["semantic_score"], info["total_score"]),
+            reverse=True,
+        )
         return ranked[:need]
 
-    def _score_field(self, field, keywords):
+    @staticmethod
+    def _score_field(field, semantic_keywords, general_keywords, concept=None):
+        """Decomposed matching evidence for one field.
+
+        Research priority: semantic description/name match > raw field-id
+        coincidence. Semantic hits on name/description count toward
+        semantic_score (the entry gate); an id hit alone never does.
+        """
         haystack_id = field.get("id", "").lower()
         haystack_name = field.get("name", "").lower()
         haystack_desc = (field.get("description") or "").lower()
-        score = 0.0
-        for kw in keywords:
+        semantic_id = semantic_name = semantic_desc = 0.0
+        general_id = general_name = general_desc = 0.0
+        matched = []
+
+        def hit(keyword):
+            if keyword not in matched:
+                matched.append(keyword)
+
+        for kw in semantic_keywords:
             if kw in haystack_id:
-                score += 3.0
+                semantic_id += 1.0
+                hit(kw)
             if kw in haystack_name:
-                score += 2.0
+                semantic_name += 4.0
+                hit(kw)
             if kw in haystack_desc:
-                score += 1.0
-        return score
+                semantic_desc += 3.0
+                hit(kw)
+        for kw in general_keywords:
+            if kw in haystack_id:
+                general_id += 0.5
+                hit(kw)
+            if kw in haystack_name:
+                general_name += 2.0
+                hit(kw)
+            if kw in haystack_desc:
+                general_desc += 1.0
+                hit(kw)
 
-    @staticmethod
-    def _keywords_from_hypothesis(hypothesis, limit=6):
-        ordered = []
-        seen = set()
-
-        def push(word):
-            w = word.lower()
-            if len(w) > 2 and w not in seen and w not in _STOPWORDS:
-                seen.add(w)
-                ordered.append(w)
-
-        for tag in hypothesis.get("tags", []):
-            for piece in re.split(r"[^a-z0-9]+", tag.lower()):
-                if piece:
-                    push(piece)
-        for piece in re.split(
-            r"[^a-z0-9]+", hypothesis.get("statement", "").lower()
-        ):
-            if piece:
-                push(piece)
-        # The hypothesis contract says WHAT economic meaning a field must
-        # have; those concept/description words join the search vocabulary so
-        # Discovery picks the real field whose meaning matches best.
-        semantics = (hypothesis.get("field_semantics") or {}).get("primary")
-        if semantics:
-            for text in (
-                str(semantics.get("concept") or ""),
-                str(semantics.get("description") or ""),
-            ):
-                for piece in re.split(r"[^a-z0-9]+", text.lower()):
-                    if piece:
-                        push(piece)
-        return ordered[:limit]
+        total = (
+            semantic_id
+            + semantic_name
+            + semantic_desc
+            + general_id
+            + general_name
+            + general_desc
+        )
+        if total <= 0:
+            return None
+        return {
+            "field": field,
+            "semantic_concept": concept,
+            "matched_terms": matched,
+            "id_score": semantic_id + general_id,
+            "name_score": semantic_name + general_name,
+            "description_score": semantic_desc + general_desc,
+            "semantic_score": semantic_name + semantic_desc,
+            "total_score": total,
+        }
 
     def discover(self, hypothesis, target_count=6, require_field_semantics=False):
         if require_field_semantics and not has_field_semantics(hypothesis):
@@ -181,46 +286,85 @@ class FieldDiscovery:
                 "field_semantics missing; Field Discovery is not allowed "
                 "for a hypothesis without a research contract"
             )
-        categories = self.categorize_hypothesis(hypothesis)
-        keywords = self._keywords_from_hypothesis(hypothesis)
+        semantic_keywords = self._semantic_keywords(hypothesis)
+        general_keywords = self._general_keywords(hypothesis)
+        concept = (
+            ((hypothesis.get("field_semantics") or {}).get("primary") or {}).get(
+                "concept"
+            )
+        )
+        datasets = self._datasets_for(hypothesis)
         chosen = []
         seen = set()
-        for category in categories:
+        outcome = {
+            "queried": [],
+            "succeeded": [],
+            "failed": [],
+            "empty_datasets": [],
+            "infra_failure": False,
+            "no_match": False,
+        }
+        for dataset_id in datasets:
             if len(chosen) >= target_count:
                 break
-            for dataset_id in DATASET_CATEGORIES[category]:
+            outcome["queried"].append(dataset_id)
+            category = self._category_of(dataset_id) or ""
+            try:
+                ranked = self._scored_fields(
+                    dataset_id,
+                    semantic_keywords,
+                    general_keywords,
+                    concept,
+                    need=target_count - len(chosen),
+                    seen=seen,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # API timeout / 429 / auth / 5xx is an infrastructure
+                # failure, never "this hypothesis has no matching field".
+                outcome["failed"].append(dataset_id)
+                logger.warning(
+                    "FIELD_DISCOVERY_FAILED dataset=%s error=%s:%s",
+                    dataset_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            outcome["succeeded"].append(dataset_id)
+            if not ranked:
+                outcome["empty_datasets"].append(dataset_id)
+            for info in ranked:
                 if len(chosen) >= target_count:
                     break
-                try:
-                    ranked = self._scored_fields(
-                        dataset_id,
-                        keywords,
-                        need=target_count - len(chosen),
-                        seen=seen,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # Never silently swallow field-discovery errors: log them so
-                    # repeated failures are visible and diagnosable.
-                    logger.warning(
-                        "FIELD_DISCOVERY_FAILED dataset=%s error=%s:%s",
-                        dataset_id,
-                        type(exc).__name__,
-                        exc,
-                    )
-                    continue
-                for score, field in ranked:
-                    if len(chosen) >= target_count:
-                        break
-                    chosen.append(
-                        {
-                            "id": field["id"],
-                            "name": field.get("name", ""),
-                            "category": category,
-                            "dataset": dataset_id,
-                            "match_score": score,
-                        }
-                    )
-                    seen.add(field["id"])
+                field = info["field"]
+                chosen.append(
+                    {
+                        "id": field["id"],
+                        "name": field.get("name", ""),
+                        "category": category,
+                        "dataset": dataset_id,
+                        "match_score": info["total_score"],
+                        "field_match": {
+                            "semantic_concept": info["semantic_concept"],
+                            "matched_terms": info["matched_terms"],
+                            "id_score": info["id_score"],
+                            "name_score": info["name_score"],
+                            "description_score": info["description_score"],
+                            "semantic_score": info["semantic_score"],
+                            "total_score": info["total_score"],
+                        },
+                    }
+                )
+                seen.add(field["id"])
+        if datasets:
+            outcome["infra_failure"] = (
+                len(outcome["failed"]) == len(datasets)
+            )
+            outcome["no_match"] = (
+                not outcome["infra_failure"]
+                and not chosen
+                and bool(outcome["succeeded"])
+            )
+        self.last_outcome = outcome
         return chosen
 
 

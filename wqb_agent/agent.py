@@ -43,8 +43,8 @@ SEED_HYPOTHESES = [
             "primary": {
                 "concept": "short_term_price_change",
                 "description": (
-                    "recent short-window price change proxying temporary "
-                    "price pressure"
+                    "recent short-window price change (short-horizon return) "
+                    "proxying temporary price pressure"
                 ),
             },
             "secondary": [],
@@ -321,6 +321,20 @@ class Agent:
                 target_count=self.fields_per_discovery,
                 require_field_semantics=True,
             )
+            outcome = getattr(self.discovery, "last_outcome", None)
+            if not fields and outcome and outcome.get("infra_failure"):
+                # Field Discovery API failure (timeout / 429 / auth / 5xx)
+                # carries no research signal. Skipping the round here must
+                # never be read as "the hypothesis has no matching fields".
+                logger.info(
+                    "ROUND_SKIPPED round=%d reason=field-discovery-infra-failure",
+                    round_no,
+                )
+                print(
+                    "Field Discovery API failed; skipping round "
+                    "(not a research conclusion)."
+                )
+                return None
             if not fields:
                 # Fall back to previously discovered fields (cache reuse).
                 fields = self._last_fields
