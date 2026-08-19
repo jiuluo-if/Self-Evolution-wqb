@@ -349,6 +349,7 @@ class Reflector:
                 score_of(exp.metrics),
                 round_no,
                 fields_used=exp.fields_used,
+                hypothesis_id=exp.hypothesis_id,
             )
 
     @staticmethod

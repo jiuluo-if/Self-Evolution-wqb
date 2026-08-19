@@ -248,13 +248,20 @@ class CandidateBuilder:
     def build_deepen(self, fields, active_alphas, count, hypothesis=None):
         candidates = []
         seen = set()
-        ctx = self._deepen_context(hypothesis)
+        base_ctx = self._deepen_context(hypothesis)
         for alpha in active_alphas:
             expr = alpha.get("expression") or ""
             if not expr:
                 continue
             if alpha.get("attempts", 0) >= self.max_deepen_per_lineage:
                 continue
+            # A deepening mutation inherits the hypothesis of the alpha it is
+            # refining, not the hypothesis of the round that happens to run it.
+            # Otherwise the same lineage root would masquerade as several
+            # independent hypotheses in the diversity fingerprint.
+            ctx = dict(base_ctx)
+            if alpha.get("hypothesis_id"):
+                ctx["hypothesis_id"] = alpha.get("hypothesis_id")
             alpha_fields = list(
                 dict.fromkeys(
                     list(alpha.get("fields_used") or []) + self._field_ids(fields)

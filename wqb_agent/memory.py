@@ -4,6 +4,7 @@ import re
 import time
 import uuid
 
+from .diversity import lineage_root, select_diverse
 from .state import score_of
 
 PROMOTE_EVIDENCE = 3
@@ -27,6 +28,7 @@ class ExperienceMemory:
         max_garbage=30,
         max_active_lineages=10,
         max_pool=12,
+        max_per_lineage=2,
         promote_evidence=PROMOTE_EVIDENCE,
     ):
         self.state_dir = state_dir
@@ -36,6 +38,7 @@ class ExperienceMemory:
         self.max_garbage = max_garbage
         self.max_active_lineages = max_active_lineages
         self.max_pool = max_pool
+        self.max_per_lineage = max_per_lineage
         self.promote_evidence = promote_evidence
 
         self.current_best = None
@@ -420,17 +423,20 @@ class ExperienceMemory:
         return {r["expression"] for r in self.submission_pool}
 
     def _trim_pool(self):
+        """Keep the pool at max_pool via diversified greedy selection, not a
+        bare score cutoff: per-lineage caps and structural coverage prevent one
+        lineage / dataset / operator family from filling the pool."""
         if len(self.submission_pool) <= self.max_pool:
             return
-        self.submission_pool.sort(
-            key=lambda r: (score_of(r.get("metrics")), r.get("created_at", 0)),
-            reverse=True,
+        self.submission_pool = select_diverse(
+            self.submission_pool,
+            self.max_pool,
+            max_per_lineage=self.max_per_lineage,
         )
-        self.submission_pool = self.submission_pool[: self.max_pool]
 
     # ---- active lineages (deepening targets) ----
 
-    def touch_lineage(self, expression, lineage, score, round_no, fields_used=None):
+    def touch_lineage(self, expression, lineage, score, round_no, fields_used=None, hypothesis_id=None):
         lineage = list(lineage or [])
         fields_used = list(fields_used or [])
         for item in self.active_lineages:
@@ -440,6 +446,8 @@ class ExperienceMemory:
                 item["last_round"] = round_no
                 if fields_used:
                     item["fields_used"] = fields_used
+                if hypothesis_id:
+                    item["hypothesis_id"] = hypothesis_id
                 item["updated"] = time.time()
                 return item
         entry = {
@@ -450,6 +458,7 @@ class ExperienceMemory:
             "attempts": 1,
             "best_score": score,
             "last_round": round_no,
+            "hypothesis_id": hypothesis_id,
             "created": time.time(),
             "updated": time.time(),
         }
@@ -463,14 +472,27 @@ class ExperienceMemory:
                 return item.get("attempts", 0)
         return 0
 
-    def deepening_targets(self, max_deepen_per_lineage, limit=4):
+    def deepening_targets(self, max_deepen_per_lineage, limit=4, max_per_lineage=2):
+        """Deepening targets, best_score first but capped per lineage root so
+        the deepening budget is not monopolized by one research family."""
         candidates = [
             item
             for item in self.active_lineages
             if item.get("attempts", 0) < max_deepen_per_lineage
         ]
         candidates.sort(key=lambda x: -x.get("best_score", -1))
-        return candidates[:limit]
+        selected = []
+        root_counts = {}
+        for item in candidates:
+            root = lineage_root(item)
+            if root and root_counts.get(root, 0) >= max_per_lineage:
+                continue
+            selected.append(item)
+            if root:
+                root_counts[root] = root_counts.get(root, 0) + 1
+            if len(selected) >= limit:
+                break
+        return selected
 
     def _trim_lineages(self):
         if len(self.active_lineages) <= self.max_active_lineages:

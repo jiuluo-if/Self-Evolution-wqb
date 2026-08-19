@@ -6,7 +6,11 @@ import time
 from .beliefs import belief_claim, belief_identity
 from .candidate import CandidateBuilder
 from .discovery import FieldDiscovery
-from .diversity import deduplicate
+from .diversity import (
+    deduplicate,
+    filter_candidates,
+    pool_diversity_summary,
+)
 from .failures import classify_error, is_research_relevant
 from .hypothesis import validate_contract
 from .memory import ExperienceMemory
@@ -364,6 +368,28 @@ class Agent:
             print("No candidates built; skipping round.")
             return None
 
+        # Early redundancy filter: reject candidates that are duplicate /
+        # redundant with already-simulated work or the submission pool before
+        # any simulation budget is spent. Research mutations (single-variable
+        # robustness probes) are still allowed through.
+        candidates, blocked = filter_candidates(
+            candidates,
+            self._simulated_expressions(),
+            self.memory.submission_pool,
+        )
+        for cand, reason in blocked:
+            logger.info(
+                "CANDIDATE_BLOCKED round=%d reason=%s expr=%s",
+                round_no, reason, (cand.get("expression") or "")[:70],
+            )
+        if not candidates:
+            logger.info(
+                "ROUND_SKIPPED round=%d reason=all-candidates-redundant",
+                round_no,
+            )
+            print("All candidates redundant with existing work; skipping round.")
+            return None
+
         experiments = self._build_experiments(round_no, hypothesis, fields, candidates)
         scheduler = self._new_scheduler(round_no)
         scheduler.add_jobs(experiments)
@@ -378,6 +404,9 @@ class Agent:
         validation_used = self._validate_suspicious(scheduler, summary, round_no)
         self._dedup_pool(round_no)
         self._prune_stale_lineages(round_no)
+        summary["diversity"] = pool_diversity_summary(
+            self.memory.submission_pool
+        )
 
         state = ResearchState(
             round_no=round_no,
@@ -401,16 +430,23 @@ class Agent:
 
     # ---- experiments & scheduling ----
 
+    def _simulated_expressions(self):
+        """Every expression that has ever been submitted to the simulator in
+        this session; a duplicate simulation is pure budget waste."""
+        return {e.expression for e in self.trajectory.experiments}
+
     def _build_experiments(self, round_no, hypothesis, fields, candidates):
         experiments = []
         for c in candidates[: self.sim_budget_per_round]:
+            exp_hypothesis_id = c.get("hypothesis_id") or hypothesis["id"]
+            exp_hypothesis = self._hypothesis_of(exp_hypothesis_id) or hypothesis
             exp = Experiment(
                 round_no,
-                hypothesis["id"],
+                exp_hypothesis_id,
                 c["expression"],
                 self.simulation_settings,
                 c.get("fields_used") or [f["id"] for f in fields],
-                datasets=hypothesis.get("datasets", []),
+                datasets=exp_hypothesis.get("datasets", []),
                 lineage=c.get("lineage", []),
             )
             exp.mutation = c.get("mutation")
@@ -702,6 +738,17 @@ class Agent:
             f"Round {summary['round']} verdicts: {summary['verdicts']} "
             f"pool={summary['pool_size']}"
         )
+        diversity = summary.get("diversity") or {}
+        if diversity:
+            print(
+                "Pool diversity: hypothesis={} dataset_family={} "
+                "operator_family={} lineage_root={}".format(
+                    len(diversity.get("hypothesis_id") or {}),
+                    len(diversity.get("dataset_family") or {}),
+                    len(diversity.get("operator_family") or {}),
+                    len(diversity.get("lineage_root") or {}),
+                )
+            )
         if summary["best"]:
             b = summary["best"]
             print(
