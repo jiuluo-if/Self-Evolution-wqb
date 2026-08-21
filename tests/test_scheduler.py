@@ -7,6 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from wqb_agent.client import WQBSimulationError
 from wqb_agent.scheduler import BacktestScheduler
 from wqb_agent.simulator import Simulator
 from wqb_agent.state import Experiment
@@ -314,8 +315,9 @@ class TestSchedulerMidFlight(unittest.TestCase):
 
     def test_midflight_state_persisted_before_submit(self):
         # The in-flight job must be in the checkpoint at the moment the backend
-        # submit call executes, i.e. the checkpoint happens before submit and
-        # records the job as PENDING with no progress_url yet.
+        # submit call executes. The worker persists the job as SUBMITTING (no
+        # progress_url yet) BEFORE issuing the POST, so a crash during or after
+        # the POST is unambiguous: a resume must never re-submit it.
         class BlockingClient(FakeClient):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
@@ -347,7 +349,7 @@ class TestSchedulerMidFlight(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(len(data.get("running", [])), 1)
         self.assertEqual(data["running"][0]["expression"], "rank(f0)")
-        self.assertEqual(data["running"][0]["status"], "PENDING")
+        self.assertEqual(data["running"][0]["status"], "SUBMITTING")
         self.assertIsNone(data["running"][0].get("progress_url"))
         self.assertEqual(data["submitted"], 1)
 
@@ -368,11 +370,11 @@ class TestExactlyOnceRecovery(unittest.TestCase):
         return os.path.join(tmpdir, "jobs.json")
 
     def _write_checkpoint(self, path, submitted, running=None,
-                          completed=None, failed=None):
+                          completed=None, failed=None, schema_version=2):
         import json
 
         data = {
-            "schema_version": 1,
+            "schema_version": schema_version,
             "submitted": submitted,
             "running": [e.to_dict() for e in (running or [])],
             "completed": [e.to_dict() for e in (completed or [])],
@@ -632,6 +634,300 @@ class TestExactlyOnceRecovery(unittest.TestCase):
         self.assertEqual(client.counter, 0)
         self.assertEqual(jobs[0].status, "DONE")
         self.assertEqual(jobs[0].mutation, "validation-window-up")
+
+
+class TestSubmitCrashWindow(unittest.TestCase):
+    """The exactly-once submit window: from the moment the worker persists
+    SUBMITTING (immediately before the POST) until the progress_url is
+    checkpointed, a crash (or a lost POST response) leaves the backend outcome
+    unknown. Those jobs must never be re-submitted and their budget slot must
+    stay consumed."""
+
+    def _path(self, tmpdir):
+        return os.path.join(tmpdir, "jobs.json")
+
+    def _write(self, path, submitted, running=None, completed=None, failed=None):
+        import json
+
+        data = {
+            "schema_version": 2,
+            "submitted": submitted,
+            "running": [e.to_dict() for e in (running or [])],
+            "completed": [e.to_dict() for e in (completed or [])],
+            "failed": [e.to_dict() for e in (failed or [])],
+        }
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def _pending(self, expr):
+        exp = make_experiments([expr])[0]
+        exp.status = "PENDING"
+        return exp
+
+    def _submitting(self, expr):
+        exp = make_experiments([expr])[0]
+        exp.status = "SUBMITTING"
+        return exp
+
+    def _submitted(self, expr, url):
+        exp = make_experiments([expr])[0]
+        exp.status = "SUBMITTED"
+        exp.progress_url = url
+        return exp
+
+    def _done(self, expr):
+        exp = make_experiments([expr])[0]
+        exp.status = "DONE"
+        exp.metrics = {"sharpe": 1.0, "fitness": 1.0}
+        return exp
+
+    # Scenario 1: crash before POST /simulations is issued. The worker had
+    # not yet persisted SUBMITTING, so the backend provably never received the
+    # submit; restart re-submits it exactly once.
+    def test_crash_before_post_resubmits_exactly_once(self):
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        self._write(path, submitted=1, running=[self._pending(expr)])
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.submissions, [expr], "exactly one submit")
+        self.assertEqual(jobs[0].status, "DONE")
+        self.assertEqual(sched._submitted, 1, "no second budget charge")
+
+    # Scenario 2: crash during the POST. The durable state is SUBMITTING with
+    # no progress_url; the backend may own a simulation, so resume must not
+    # re-submit and the slot stays consumed.
+    def test_crash_during_post_not_resubmitted(self):
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        self._write(path, submitted=1, running=[self._submitting(expr)])
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.submissions, [], "ambiguous submit is never re-submitted")
+        self.assertEqual(client.counter, 0)
+        self.assertEqual(jobs[0].status, "SUBMIT_UNKNOWN")
+        self.assertEqual(sched._submitted, 1, "budget slot stays consumed")
+
+    # Scenario 3: POST accepted by BRAIN but the response is lost. Within one
+    # process the ambiguous outcome raises immediately (no retry), and a
+    # restart keeps refusing to re-submit.
+    def test_response_lost_after_accept_is_submit_unknown_not_retried(self):
+        class ResponseLostClient(FakeClient):
+            def submit_simulation(self, expression, settings, alpha_type="REGULAR"):
+                # Backend records the simulation, then the response is lost.
+                self.counter += 1
+                url = f"progress-{self.counter}"
+                self._expr_by_url[url] = expression
+                self.submissions.append(expression)
+                raise WQBSimulationError("connection reset after response")
+
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        client = ResponseLostClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=1, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.counter, 1, "exactly one POST, no ambiguous retry")
+        self.assertEqual(jobs[0].status, "SUBMIT_UNKNOWN")
+        self.assertIn("submit_unknown", jobs[0].error)
+
+        # Second crash/resume over the same checkpoint: still no re-submit.
+        client2 = FakeClient()
+        sched2 = BacktestScheduler(
+            client2, Simulator(client2), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs2 = make_experiments([expr])
+        sched2.add_jobs(jobs2)
+        sched2.run()
+        self.assertEqual(client2.submissions, [], "still no re-submit after restart")
+        self.assertEqual(jobs2[0].status, "SUBMIT_UNKNOWN")
+
+    # Scenario 4: the submit response is received but the post-submit
+    # checkpoint has not run yet. The durable state is exactly the SUBMITTING
+    # checkpoint written before the POST, which scenario 2 proves is never
+    # re-submitted.
+    def test_response_received_before_checkpoint_leaves_submitting(self):
+        class BlockingClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def submit_simulation(self, expression, settings, alpha_type="REGULAR"):
+                self.entered.set()
+                self.release.wait(timeout=5)
+                return super().submit_simulation(
+                    expression, settings, alpha_type=alpha_type)
+
+        import json
+
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        client = BlockingClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=1, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments(["rank(f0)"])
+        sched.add_jobs(jobs)
+
+        worker = threading.Thread(target=sched.run)
+        worker.start()
+        self.assertTrue(client.entered.wait(timeout=5))
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(data["running"][0]["status"], "SUBMITTING")
+        self.assertIsNone(data["running"][0].get("progress_url"))
+        self.assertEqual(data["submitted"], 1)
+
+        client.release.set()
+        worker.join(timeout=10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(jobs[0].status, "DONE")
+
+    # Scenario 5: crash during poll with a persisted progress_url. Resume
+    # keeps polling the existing simulation; zero POST /simulations.
+    def test_crash_during_poll_resumes_with_poll(self):
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        url = "progress-7"
+        self._write(path, submitted=1, running=[self._submitted(expr, url)])
+
+        client = FakeClient()
+        client._expr_by_url[url] = expr
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.submissions, [], "poll only, no re-submit")
+        self.assertEqual(jobs[0].status, "DONE")
+
+    # Scenario 6: completed resume. The outcome is restored, nothing runs.
+    def test_completed_resume_restores_without_submit(self):
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        self._write(path, submitted=1, completed=[self._done(expr)])
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.counter, 0)
+        self.assertEqual(jobs[0].status, "DONE")
+        self.assertEqual(jobs[0].metrics["sharpe"], 1.0)
+
+    # The ambiguous slot is never re-minted across a restart: budget=1 with one
+    # already-consumed ambiguous slot leaves nothing for fresh expressions.
+    def test_submit_unknown_slot_consumes_budget_across_restart(self):
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        crashed, fresh = "rank(f0)", "rank(f1)"
+        self._write(path, submitted=1, running=[self._submitting(crashed)])
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=1,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([crashed, fresh])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.counter, 0, "budget exhausted by the ambiguous slot")
+        by_expr = {j.expression: j for j in jobs}
+        self.assertEqual(by_expr[crashed].status, "SUBMIT_UNKNOWN")
+        self.assertEqual(by_expr[fresh].status, "SKIPPED")
+        self.assertEqual(sched._submitted, 1)
+
+    # A double crash after the first resume checkpoints SUBMIT_UNKNOWN: the
+    # second restart still refuses to submit the expression.
+    def test_double_crash_keeps_submit_unknown_out_of_submission(self):
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        self._write(path, submitted=1, running=[self._submitting(expr)])
+
+        client1 = FakeClient()
+        sched1 = BacktestScheduler(
+            client1, Simulator(client1), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        sched1.add_jobs(make_experiments([expr]))
+        sched1.run()
+
+        client2 = FakeClient()
+        sched2 = BacktestScheduler(
+            client2, Simulator(client2), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs2 = make_experiments([expr])
+        sched2.add_jobs(jobs2)
+        sched2.run()
+        self.assertEqual(client2.submissions, [], "still no re-submit after double crash")
+        self.assertEqual(jobs2[0].status, "SUBMIT_UNKNOWN")
+        self.assertEqual(sched2._submitted, 1)
+
+    # Legacy checkpoints written by the old code recorded PENDING+no-url for
+    # jobs whose submit may have reached the backend. Resume must treat them as
+    # ambiguous rather than blindly re-submitting.
+    def test_legacy_v1_pending_no_url_treated_as_ambiguous(self):
+        import json
+
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        expr = "rank(f0)"
+        pending = self._pending(expr)
+        with open(path, "w") as f:
+            json.dump({
+                "schema_version": 1,
+                "submitted": 1,
+                "running": [pending.to_dict()],
+                "completed": [],
+                "failed": [],
+            }, f)
+
+        client = FakeClient()
+        sched = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        jobs = make_experiments([expr])
+        sched.add_jobs(jobs)
+        sched.run()
+        self.assertEqual(client.submissions, [], "legacy PENDING is ambiguous, no re-submit")
+        self.assertEqual(jobs[0].status, "FAILED")
+        self.assertIn("crash_mid_flight", jobs[0].error)
+        self.assertEqual(sched._submitted, 1)
 
 
 if __name__ == "__main__":

@@ -16,13 +16,14 @@ import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
+from .failures import FailureKind, classify_error
 from .state import Experiment
 
 logger = logging.getLogger("wqb.scheduler")
 
 
 class BacktestScheduler:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -54,6 +55,7 @@ class BacktestScheduler:
         # again: the backend already owns a simulation for them.
         self._no_retry = set()
         self._since_checkpoint = 0
+        self._schema_version = self.SCHEMA_VERSION
         # Worker threads checkpoint() right after a successful backend submit
         # to persist the recoverable progress_url; the lock keeps concurrent
         # checkpoints from interleaving on the tmp file.
@@ -211,11 +213,30 @@ class BacktestScheduler:
     def _run_job(self, job_id):
         """Worker step for one job: submit if not yet submitted, persist the
         progress_url immediately, then poll to completion. Restored jobs with
-        an existing progress_url skip straight to polling."""
+        an existing progress_url skip straight to polling.
+
+        Exactly-once submit window: before the POST is issued the worker
+        checkpoints the job as SUBMITTING. From that instant until the
+        progress_url is persisted, the backend may or may not own a
+        simulation, so a crash (or a lost POST response) is resumed as an
+        ambiguous outcome and never re-submitted. A job still marked PENDING
+        in the checkpoint provably never started its submit, so it is safe to
+        re-submit on resume.
+        """
         exp = self._jobs[job_id]
         try:
             if exp.status == "PENDING":
-                self.simulator.submit(exp, poll_timeout_sec=self.poll_timeout_sec)
+                # Durable marker that the submit attempt is starting; after
+                # this point a crash leaves an ambiguous backend outcome.
+                exp.status = "SUBMITTING"
+                self._checkpoint()
+                try:
+                    self.simulator.submit(exp, poll_timeout_sec=self.poll_timeout_sec)
+                except Exception as exc:  # noqa: BLE001
+                    if self._submit_outcome_known(exc):
+                        raise
+                    self._mark_submit_unknown(exp, exc)
+                    return exp
                 # The backend owns a simulation now; make the progress_url
                 # durable before polling so a crash resumes the poll instead
                 # of creating a duplicate simulation.
@@ -226,6 +247,32 @@ class BacktestScheduler:
             exp.error = f"{type(exc).__name__}: {exc}"
             exp.status = "FAILED"
         return exp
+
+    @staticmethod
+    def _submit_outcome_known(exc):
+        """A confirmed rejection means the backend did NOT accept the
+        submission; anything else (timeout, network error, 5xx, missing
+        Location, or an unexpected exception) is ambiguous. Typed client
+        errors carry a `.kind`; plain exceptions are classified by text."""
+        kind = getattr(exc, "kind", None) or classify_error(str(exc))
+        return kind in (
+            FailureKind.SYNTAX,
+            FailureKind.AUTH,
+            FailureKind.DATA,
+            FailureKind.RATE_LIMIT,
+        )
+
+    def _mark_submit_unknown(self, exp, exc):
+        """A submit whose backend outcome is unknown: the expression may have
+        been accepted, so it must never be submitted again and its budget slot
+        stays consumed."""
+        exp.status = "SUBMIT_UNKNOWN"
+        exp.error = f"submit_unknown: {type(exc).__name__}: {exc}"
+        self._no_retry.add(exp.expression)
+        logger.warning(
+            "BACKTEST_JOB_SUBMIT_UNKNOWN job_id=%s expression=%s error=%s",
+            exp.id, exp.expression[:60], exp.error,
+        )
 
     def _finalize(self, job_id):
         exp = self._jobs[job_id]
@@ -285,6 +332,7 @@ class BacktestScheduler:
             return
         with open(self.checkpoint_path) as f:
             data = json.load(f)
+        self._schema_version = data.get("schema_version", 1)
         self._submitted = data.get("submitted", 0)
         # Jobs added by the caller (agent) via add_jobs already carry the
         # fresh Experiment objects; a checkpoint entry for the same expression
@@ -307,24 +355,22 @@ class BacktestScheduler:
             self._completed[exp.id] = exp
         for edict in data.get("failed", []):
             exp = Experiment.from_dict(edict)
-            if exp.expression in queued:
-                target_id = queued[exp.expression]
-                target = self._jobs[target_id]
-                self._restore_result(target, exp)
-                self._failed[target_id] = target
-                if "crash_mid_flight" in (exp.error or ""):
-                    # A previous resume already turned a mid-flight job into a
-                    # FAILED outcome; keep it out of the submission path even
-                    # if the process crashed again before checkpointing it.
-                    self._no_retry.add(exp.expression)
-                continue
-            self._jobs[exp.id] = exp
-            self._failed[exp.id] = exp
-            if "crash_mid_flight" in (exp.error or ""):
-                # A previous resume already turned a mid-flight job into a
-                # FAILED outcome; keep it out of the submission path even if
-                # the process crashed again before checkpointing it as such.
+            if self._is_no_retry(exp):
+                # The backend outcome is unknown or already owned; the
+                # expression must never be submitted again. Keep the recorded
+                # failure and leave the budget slot consumed.
                 self._no_retry.add(exp.expression)
+                self._restore_failed(queued, exp)
+                continue
+            if exp.progress_url:
+                # A confirmed submission that failed while polling: resume by
+                # polling the existing simulation, never by POSTing again.
+                self._restore_failed(queued, exp, resume_poll=True)
+                continue
+            # A confirmed rejection (syntax/auth/data/rate-limit): keep the
+            # recorded failure. Re-queuing is preserved as pre-existing
+            # behavior for such rejections.
+            self._restore_failed(queued, exp)
         for edict in data.get("running", []):
             exp = Experiment.from_dict(edict)
             if exp.expression in queued:
@@ -339,19 +385,61 @@ class BacktestScheduler:
                 self._jobs[exp.id] = exp
                 self._restore_running(exp.id, exp, exp)
         logger.info(
-            "SCHEDULER_RESUMED path=%s completed=%d failed=%d midflight=%d "
-            "submitted=%d",
-            self.checkpoint_path, len(self._completed), len(self._failed),
-            len(self._no_retry), self._submitted,
+            "SCHEDULER_RESUMED path=%s schema=%d completed=%d failed=%d "
+            "midflight=%d submitted=%d",
+            self.checkpoint_path, self._schema_version, len(self._completed),
+            len(self._failed), len(self._no_retry), self._submitted,
+        )
+
+    def _restore_failed(self, queued, exp, resume_poll=False):
+        """Merge a checkpoint FAILED entry back onto the caller's job object
+        (or keep it as an orphan) and, for confirmed submissions that failed
+        during polling, route it back through _restore_running so the existing
+        simulation is polled instead of re-submitted."""
+        if exp.expression in queued:
+            target_id = queued[exp.expression]
+            target = self._jobs[target_id]
+            self._restore_result(target, exp)
+            if resume_poll:
+                target.progress_url = exp.progress_url
+                target.alpha_id = exp.alpha_id
+                self._queue.remove(target_id)
+                self._restore_running(target_id, target, exp)
+            else:
+                self._failed[target_id] = target
+            return
+        if resume_poll:
+            self._jobs[exp.id] = exp
+            self._restore_running(exp.id, exp, exp)
+            return
+        self._jobs[exp.id] = exp
+        self._failed[exp.id] = exp
+
+    @staticmethod
+    def _is_no_retry(exp):
+        """True when the persisted failure means the expression must never be
+        submitted again: an unknown submit outcome, or a previous resume that
+        already marked a mid-flight job as failed."""
+        error = exp.error or ""
+        return (
+            exp.status == "SUBMIT_UNKNOWN"
+            or "crash_mid_flight" in error
+            or "submit_unknown" in error
         )
 
     def _restore_running(self, job_id, target, snapshot):
         """Route a restored in-flight job by its recoverable state:
         - progress_url present -> continue polling the existing simulation
-        - PENDING, no url       -> the slot was reserved but the backend never
-                                   received a submit; re-submit (no new charge)
-        - anything else (legacy RUNNING / in-flight submit) -> cannot be
-          recovered; fail it and never submit the expression again."""
+        - PENDING, no url       -> the worker never started the submit (it
+                                   checkpoints SUBMITTING first), so the
+                                   backend never received it; re-submit with
+                                   no new budget charge
+        - SUBMITTING / SUBMIT_UNKNOWN, no url -> the submit may have reached
+          the backend; the outcome is unknown, so never re-submit and keep the
+          budget slot consumed
+        - anything else (legacy RUNNING / v1 PENDING / in-flight submit) ->
+          cannot be recovered; fail it and never submit the expression again.
+        """
         if snapshot.progress_url:
             target.status = (
                 snapshot.status
@@ -364,11 +452,25 @@ class BacktestScheduler:
                 "resume=poll url=%s",
                 job_id, target.expression[:60], snapshot.progress_url,
             )
-        elif snapshot.status == "PENDING":
+        elif snapshot.status == "PENDING" and self._schema_version >= 2:
             target.status = "PENDING"
             self._running.add(job_id)
             logger.info(
                 "BACKTEST_JOB_RECOVERED job_id=%s expression=%s resume=submit",
+                job_id, target.expression[:60],
+            )
+        elif snapshot.status in ("SUBMITTING", "SUBMIT_UNKNOWN"):
+            target.status = "SUBMIT_UNKNOWN"
+            target.error = (
+                snapshot.error
+                or "submit_unknown: crash while submitting; backend outcome unknown"
+            )
+            target.progress_url = snapshot.progress_url
+            self._failed[job_id] = target
+            self._no_retry.add(target.expression)
+            logger.warning(
+                "BACKTEST_JOB_SUBMIT_UNKNOWN job_id=%s expression=%s "
+                "marked submit_unknown, not re-submitted",
                 job_id, target.expression[:60],
             )
         else:

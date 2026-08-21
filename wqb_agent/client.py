@@ -177,8 +177,16 @@ class WQBClient:
     # ---- unified request ----
 
     def _request(self, method, url, *, params=None, json=None, timeout=60,
-                 accepted=(200,), context="request"):
-        """Single retry policy shared by every HTTP call."""
+                 accepted=(200,), context="request", retry_ambiguous=True):
+        """Single retry policy shared by every HTTP call.
+
+        retry_ambiguous=False is for non-idempotent writes (POST /simulations):
+        a network error, timeout, or 5xx after the request may have reached the
+        server means we cannot tell whether it was accepted. Retrying would
+        risk a duplicate backend object, so the first ambiguous outcome raises
+        immediately. 401 re-auth and 429 retries are kept: both are confirmed
+        non-acceptance, so re-sending is safe.
+        """
         for attempt in range(self.max_retries):
             self._ensure_auth()
             try:
@@ -186,14 +194,14 @@ class WQBClient:
                     method, url, params=params, json=json, timeout=timeout
                 )
             except requests.exceptions.Timeout as exc:
-                if attempt >= self.max_retries - 1:
+                if not retry_ambiguous or attempt >= self.max_retries - 1:
                     raise WQBTimeoutError(
                         f"{context} timed out after {self.max_retries} attempts."
                     ) from exc
                 time.sleep(self._backoff(attempt))
                 continue
             except requests.exceptions.RequestException as exc:
-                if attempt >= self.max_retries - 1:
+                if not retry_ambiguous or attempt >= self.max_retries - 1:
                     raise WQBSimulationError(
                         f"{context} network error after {self.max_retries} "
                         f"attempts: {exc}"
@@ -215,7 +223,7 @@ class WQBClient:
                     resp.status_code, resp.text, context
                 )
             if resp.status_code >= 500:
-                if attempt >= self.max_retries - 1:
+                if not retry_ambiguous or attempt >= self.max_retries - 1:
                     raise self._classified_exception(
                         resp.status_code, resp.text, context
                     )
@@ -242,12 +250,17 @@ class WQBClient:
 
     def submit_simulation(self, expression, settings, alpha_type="REGULAR"):
         body = {"type": alpha_type, "settings": settings, "regular": expression}
+        # A POST that is accepted by BRAIN creates a simulation that consumes
+        # budget. Never auto-retry an ambiguous outcome (network error,
+        # timeout, 5xx): the request may already have been accepted, and a
+        # retry would double-submit the same expression.
         resp = self._request(
             "POST",
             f"{self.base_url}/simulations",
             json=body,
             accepted=(201, 200),
             context=f"submit simulation {expression[:60]}",
+            retry_ambiguous=False,
         )
         location = resp.headers.get("Location")
         if not location:

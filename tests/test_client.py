@@ -179,6 +179,74 @@ class TestRequestRetryPolicy(unittest.TestCase):
         self.assertEqual(getattr(ctx.exception, "kind", None), "TIMEOUT")
 
 
+class TestSubmitSimulationAmbiguity(unittest.TestCase):
+    """submit_simulation is a non-idempotent write: an ambiguous outcome
+    (network error, timeout, 5xx) may already have been accepted by BRAIN, so
+    it must raise after a single attempt instead of retrying into a duplicate
+    simulation. Confirmed rejections (4xx) still fail fast with one call."""
+
+    def _client(self, responses, max_retries=5):
+        import requests
+
+        return make_client(responses, max_retries=max_retries)
+
+    def test_ambiguous_connection_error_does_not_retry_post(self):
+        import requests
+
+        client = self._client(
+            [requests.exceptions.ConnectionError("response lost")] * 5,
+            max_retries=5,
+        )
+        with patch("wqb_agent.client.time.sleep"):
+            with self.assertRaises(Exception) as ctx:
+                client.submit_simulation("rank(close)", {})
+        self.assertEqual(getattr(ctx.exception, "kind", None), "INFRA")
+        self.assertEqual(
+            len(client._local.session.calls), 1,
+            "a non-idempotent POST must never be retried on an ambiguous error",
+        )
+
+    def test_ambiguous_timeout_does_not_retry_post(self):
+        import requests
+
+        client = self._client(
+            [requests.exceptions.Timeout("slow")] * 5, max_retries=5
+        )
+        with patch("wqb_agent.client.time.sleep"):
+            with self.assertRaises(Exception) as ctx:
+                client.submit_simulation("rank(close)", {})
+        self.assertEqual(getattr(ctx.exception, "kind", None), "TIMEOUT")
+        self.assertEqual(len(client._local.session.calls), 1)
+
+    def test_ambiguous_5xx_does_not_retry_post(self):
+        client = self._client([MockResponse(500, text="boom")] * 5, max_retries=5)
+        with patch("wqb_agent.client.time.sleep"):
+            with self.assertRaises(Exception) as ctx:
+                client.submit_simulation("rank(close)", {})
+        self.assertEqual(getattr(ctx.exception, "kind", None), "INFRA")
+        self.assertEqual(len(client._local.session.calls), 1)
+
+    def test_confirmed_rejection_fails_fast_with_one_call(self):
+        client = self._client([MockResponse(422, text="bad expression")])
+        with self.assertRaises(WQBRejectedError):
+            client.submit_simulation("rank(close)", {})
+        self.assertEqual(len(client._local.session.calls), 1)
+
+    def test_accept_returns_location(self):
+        client = self._client(
+            [MockResponse(201, {}, {"Location": "http://brain.test/sims/1"})]
+        )
+        url = client.submit_simulation("rank(close)", {})
+        self.assertEqual(url, "http://brain.test/sims/1")
+        self.assertEqual(len(client._local.session.calls), 1)
+
+    def test_missing_location_header_is_ambiguous(self):
+        client = self._client([MockResponse(201, {}, {})])
+        with self.assertRaises(Exception) as ctx:
+            client.submit_simulation("rank(close)", {})
+        self.assertEqual(getattr(ctx.exception, "kind", None), "INFRA")
+
+
 class TestPollProgress(unittest.TestCase):
     def test_poll_422_fails_fast(self):
         client = make_client([MockResponse(422, text="invalid")])

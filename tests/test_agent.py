@@ -353,6 +353,24 @@ class TestReflection(unittest.TestCase):
         self.assertEqual(len(memory.avoid), 1)
         self.assertIn("syntax", memory.avoid[0]["reason"])
 
+    def test_submit_unknown_never_enters_research_memory(self):
+        # A submit whose backend outcome is unknown (crash mid-POST, lost
+        # response) carries no research signal: it must not become a lesson,
+        # an avoid direction, a belief contradiction, a pool entry, or the
+        # current best.
+        memory = ExperienceMemory(state_dir="/tmp/wqb_test_submit_unknown")
+        reflector = Reflector(memory)
+        e = Experiment(1, "h", "rank(close)", {}, ["close"])
+        e.status = "SUBMIT_UNKNOWN"
+        e.error = "submit_unknown: WQBSimulationError: connection reset after response"
+        summary = reflector.reflect(1, {"tags": ["price"], "direction": "long"}, [e])
+        self.assertEqual(summary["verdicts"].get("FAIL"), 1)
+        self.assertEqual(len(memory.lessons), 0)
+        self.assertEqual(len(memory.avoid), 0)
+        self.assertEqual(len(memory.beliefs), 0)
+        self.assertEqual(len(memory.submission_pool), 0)
+        self.assertIsNone(memory.current_best)
+
     def test_suspicious_high_signal_flagged(self):
         memory = ExperienceMemory(state_dir="/tmp/wqb_test_susp")
         reflector = Reflector(memory, high_sharpe=2.0, high_fitness=2.0)

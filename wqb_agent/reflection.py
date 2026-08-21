@@ -60,6 +60,15 @@ class Reflector:
                 "kind": kind,
                 "reason": self._diagnose_error(exp),
             }
+        if exp.status == "SUBMIT_UNKNOWN":
+            # The submit may or may not have been accepted by the backend; the
+            # outcome carries no research signal and must never enter research
+            # memory as support or contradiction.
+            return {
+                "label": "FAIL",
+                "kind": FailureKind.INFRA,
+                "reason": "submit outcome unknown (may have been accepted)",
+            }
         metrics = exp.metrics or {}
         passed = _passed(metrics)
         failed_checks = [
@@ -142,7 +151,7 @@ class Reflector:
         }
 
     def _learn(self, round_no, hypothesis, exp, verdict):
-        if exp.status == "FAILED":
+        if exp.status in ("FAILED", "SUBMIT_UNKNOWN"):
             kind = verdict.get("kind", "RESEARCH")
             if not is_research_relevant(kind):
                 # Infrastructure / auth / rate-limit / timeout failures carry no
