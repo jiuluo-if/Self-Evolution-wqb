@@ -8,6 +8,7 @@ experience.
 """
 
 import re
+from functools import lru_cache
 
 
 class FailureKind:
@@ -40,8 +41,13 @@ _INFRA_RE = re.compile(r"5\d\d|connection|timeout|broken|unavailable|refused|"
                        r"network|temporary", re.IGNORECASE)
 
 
+@lru_cache(maxsize=512)
 def classify_error(error_text, status_code=None):
-    """Map an error (message + optional status code) to a FailureKind."""
+    """Map an error (message + optional status code) to a FailureKind.
+
+    Error messages repeat heavily within a run (the same syntax / timeout text
+    for every affected expression), so the regex scan is cached by text.
+    """
     text = error_text or ""
     if status_code == 401:
         return FailureKind.AUTH

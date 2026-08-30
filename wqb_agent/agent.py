@@ -613,6 +613,8 @@ class Agent:
 
     def _apply_validation(self, rec, stable, round_no, sims):
         rec_obj = AlphaRecord.from_dict(rec)
+        bkey = self._belief_key_of(rec)
+        bclaim = self._belief_claim_of(rec)
         if stable:
             rec_obj.status = AlphaRecord.STATUS_VALIDATED
             self.memory.add_alpha(rec_obj)
@@ -626,8 +628,8 @@ class Agent:
             # Robustness validation confirms the high-signal hit: it becomes
             # strong support for the belief on these fields.
             self.memory.record_evidence(
-                self._belief_key_of(rec),
-                self._belief_claim_of(rec),
+                bkey,
+                bclaim,
                 "support",
                 round_no,
                 source=self._validation_source(rec, round_no),
@@ -649,8 +651,8 @@ class Agent:
             # that these fields carry a high signal is contradicted, not just
             # dropped into garbage.
             self.memory.record_evidence(
-                self._belief_key_of(rec),
-                self._belief_claim_of(rec),
+                bkey,
+                bclaim,
                 "contradict",
                 round_no,
                 source=self._validation_source(rec, round_no),

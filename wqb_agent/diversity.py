@@ -269,15 +269,19 @@ def is_redundant(record, pool_records, expr_th=0.6, field_th=0.5,
 def deduplicate(pool_records, expr_th=0.6, field_th=0.6):
     """Drop near-duplicates, keeping the best-scoring one of each group."""
     kept = []
+    kept_fps = []
     dropped = []
     for rec in sorted(
         pool_records, key=lambda r: score_of(r.get("metrics")), reverse=True
     ):
-        redundant, _ = is_redundant(rec, kept, expr_th=expr_th, field_th=field_th)
+        redundant, _ = is_redundant(
+            rec, kept, expr_th=expr_th, field_th=field_th, _pool_fps=kept_fps
+        )
         if redundant:
             dropped.append(rec)
         else:
             kept.append(rec)
+            kept_fps.append(fingerprint(rec))
     return kept, dropped
 
 
@@ -400,11 +404,23 @@ def concentration(pool_records, key="lineage_root"):
 
 
 def pool_diversity_summary(pool_records):
-    """Per-dimension concentration for logging and tests."""
-    return {
-        dim: concentration(pool_records, dim)
-        for dim in ("hypothesis_id", "dataset_family", "operator_family", "lineage_root")
-    }
+    """Per-dimension concentration for logging and tests.
+
+    Computed in a single pass over the pool so each record's fingerprint is
+    derived once instead of once per dimension.
+    """
+    dims = ("hypothesis_id", "dataset_family", "operator_family", "lineage_root")
+    counts = {dim: {} for dim in dims}
+    for rec in pool_records:
+        f = fingerprint(rec)
+        for dim in dims:
+            value = f[dim]
+            if isinstance(value, (list, tuple, set)):
+                for v in value or [None]:
+                    counts[dim][v] = counts[dim].get(v, 0) + 1
+            else:
+                counts[dim][value] = counts[dim].get(value, 0) + 1
+    return counts
 
 
 # ---- pre-simulation candidate filter ----

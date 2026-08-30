@@ -1,4 +1,5 @@
 import re
+from functools import lru_cache
 
 from .diversity import extract_fields
 
@@ -7,6 +8,14 @@ WINDOW_STEPS = [5, 10, 20, 60]
 _TS_OP_RE = re.compile(
     r"(ts_(?:rank|mean|std_dev|sum|delta|min|max|zscore|corr)\([^,]+,\s*)(\d+)"
 )
+
+
+@lru_cache(maxsize=1024)
+def _field_regex(field_id):
+    """Word-boundary match for one field id, compiled once per id. Field-swap
+    and primary-field detection reuse it across candidates instead of
+    re-compiling for every mutation."""
+    return re.compile(r"\b" + re.escape(field_id) + r"\b")
 
 
 def _window_change(expression, direction):
@@ -39,8 +48,7 @@ def _window_change(expression, direction):
 def _swap_field(expression, old_field, new_field):
     if new_field == old_field:
         return None
-    pattern = re.compile(r"\b" + re.escape(old_field) + r"\b")
-    swapped = pattern.sub(new_field, expression)
+    swapped = _field_regex(old_field).sub(new_field, expression)
     if swapped == expression:
         return None
     return swapped
@@ -249,6 +257,10 @@ class CandidateBuilder:
         candidates = []
         seen = set()
         base_ctx = self._deepen_context(hypothesis)
+        # The field-id -> meta map is shared by every alpha; build it once.
+        field_meta = {
+            f["id"]: f for f in fields if isinstance(f, dict) and f.get("id")
+        }
         for alpha in active_alphas:
             expr = alpha.get("expression") or ""
             if not expr:
@@ -267,9 +279,6 @@ class CandidateBuilder:
                     list(alpha.get("fields_used") or []) + self._field_ids(fields)
                 )
             )
-            field_meta = {
-                f["id"]: f for f in fields if isinstance(f, dict) and f.get("id")
-            }
             for cand in self._mutations(
                 expr, alpha.get("lineage") or [], alpha_fields, field_meta, ctx
             ):
@@ -493,7 +502,7 @@ class CandidateBuilder:
     def _primary_field(expr, fields):
         for f in fields:
             fid = f["id"] if isinstance(f, dict) else f
-            if re.search(r"\b" + re.escape(fid) + r"\b", expr):
+            if _field_regex(fid).search(expr):
                 return fid
         return None
 

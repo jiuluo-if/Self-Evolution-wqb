@@ -130,7 +130,7 @@ class ExperienceMemory:
         path = self.memory_path()
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(data, f, indent=2, default=self._json_default)
+            json.dump(data, f, default=self._json_default)
         os.replace(tmp, path)
 
     @staticmethod

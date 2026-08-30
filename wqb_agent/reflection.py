@@ -158,6 +158,7 @@ class Reflector:
                                hypothesis=hypothesis)
         bclaim = belief_claim(exp.hypothesis_id, exp.fields_used,
                               hypothesis=hypothesis)
+        source = self._source_of(exp)
         if exp.status in ("FAILED", "SUBMIT_UNKNOWN"):
             kind = verdict.get("kind", "RESEARCH")
             if not is_research_relevant(kind):
@@ -175,7 +176,7 @@ class Reflector:
                     self._direction_key(exp),
                     self._diagnose_error(exp),
                     round_no,
-                    source=self._source_of(exp),
+                    source=source,
                 )
                 if self.memory.is_avoided(self._direction_key(exp)):
                     self.memory.archive(
@@ -188,7 +189,7 @@ class Reflector:
                 self._direction_key(exp),
                 self._diagnose_error(exp),
                 round_no,
-                source=self._source_of(exp),
+                source=source,
             )
             if self.memory.is_avoided(self._direction_key(exp)):
                 self.memory.archive(
@@ -199,7 +200,7 @@ class Reflector:
                 bclaim,
                 "contradict",
                 round_no,
-                source=self._source_of(exp),
+                source=source,
                 kind="financial_negative",
             )
             return
@@ -215,14 +216,14 @@ class Reflector:
                 round_no,
                 evidence=1,
                 confidence=0.7,
-                source=self._source_of(exp),
+                source=source,
             )
             self.memory.record_evidence(
                 bkey,
                 bclaim,
                 "support",
                 round_no,
-                source=self._source_of(exp),
+                source=source,
                 kind="success",
             )
         elif verdict["label"] == "SUSPICIOUS":
@@ -232,7 +233,7 @@ class Reflector:
                 round_no,
                 evidence=1,
                 confidence=0.2,
-                source=self._source_of(exp),
+                source=source,
             )
             # Pending: a high-signal hit is not yet strong support. It only
             # counts once robustness validation confirms it (or becomes a
@@ -242,7 +243,7 @@ class Reflector:
                 bclaim,
                 "pending",
                 round_no,
-                source=self._source_of(exp),
+                source=source,
                 kind="suspicious_high_signal",
             )
         elif verdict["label"] == "PROMISING":
@@ -251,14 +252,14 @@ class Reflector:
                 round_no,
                 evidence=1,
                 confidence=0.3,
-                source=self._source_of(exp),
+                source=source,
             )
             self.memory.record_evidence(
                 bkey,
                 bclaim,
                 "support",
                 round_no,
-                source=self._source_of(exp),
+                source=source,
                 kind="promising",
             )
             self.memory.add_next(
@@ -272,7 +273,7 @@ class Reflector:
                 self._direction_key(exp),
                 f"sharpe={metrics.get('sharpe')}, turnover={metrics.get('turnover')}",
                 round_no,
-                source=self._source_of(exp),
+                source=source,
             )
             # Financial negative evidence: a valid research result opposing the
             # belief on these fields. Not a lesson to be text-merged with
@@ -282,7 +283,7 @@ class Reflector:
                 bclaim,
                 "contradict",
                 round_no,
-                source=self._source_of(exp),
+                source=source,
                 kind="financial_negative",
             )
 
@@ -294,7 +295,7 @@ class Reflector:
                 round_no,
                 evidence=1,
                 confidence=0.3,
-                source=self._source_of(exp),
+                source=source,
             )
 
     def _flag_suspicious(self, results):
