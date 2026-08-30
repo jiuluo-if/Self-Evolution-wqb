@@ -269,6 +269,7 @@ class Agent:
             self.client,
             pagination_limit=self.pagination_limit,
             max_pages=self.max_pagination_pages,
+            cache_path=os.path.join(self.state_dir, "fields_cache.json"),
         )
         self.simulator = Simulator(
             self.client,
@@ -502,9 +503,7 @@ class Agent:
         }
 
     def _choose_hypothesis(self, round_no):
-        used = self._used_hypothesis_ids()
-        failure_counts = self._hypothesis_failure_counts()
-        parked = self._parked_hypotheses()
+        used, failure_counts, last_used, parked = self._hypothesis_stats()
         available = [h for h in SEED_HYPOTHESES if h["id"] not in parked]
         unused = [h for h in available if h["id"] not in used]
         if unused:
@@ -514,21 +513,35 @@ class Agent:
                 available,
                 key=lambda h: (
                     failure_counts.get(h["id"], 0),
-                    self._last_used_round(h["id"]),
+                    last_used.get(h["id"], 0),
                 ),
             )
         if not candidates:
             candidates = list(SEED_HYPOTHESES)
         return dict(candidates[0])
 
-    def _parked_hypotheses(self):
-        """A hypothesis whose last two experiments both failed for
-        research-level reasons is parked until evidence suggests revisiting it.
-        Infrastructure failures (timeout / auth / rate-limit / 5xx) carry no
-        research signal and must not pause a direction."""
+    def _hypothesis_stats(self):
+        """One traversal of the trajectory producing every statistic the
+        hypothesis-selection logic needs: used hypothesis ids, per-hypothesis
+        research-failure counts, last-used round, and parked hypotheses.
+
+        The selection helpers below are thin wrappers around it so tests keep
+        calling the named accessors while a single pass serves the planner.
+        """
+        used = set()
+        failure_counts = {}
+        last_used = {}
         by_hypothesis = {}
         for exp in self.trajectory.experiments:
-            by_hypothesis.setdefault(exp.hypothesis_id, []).append(exp)
+            hid = exp.hypothesis_id
+            if hid:
+                used.add(hid)
+                last_used[hid] = max(last_used.get(hid, 0), exp.round or 0)
+            if exp.status == "FAILED" and is_research_relevant(
+                classify_error(exp.error)
+            ):
+                failure_counts[hid] = failure_counts.get(hid, 0) + 1
+            by_hypothesis.setdefault(hid, []).append(exp)
         parked = set()
         for hid, exps in by_hypothesis.items():
             research_fails = [
@@ -538,27 +551,23 @@ class Agent:
             ]
             if len(research_fails) >= 2:
                 parked.add(hid)
-        return parked
+        return used, failure_counts, last_used, parked
+
+    def _parked_hypotheses(self):
+        """A hypothesis whose last two experiments both failed for
+        research-level reasons is parked until evidence suggests revisiting it.
+        Infrastructure failures (timeout / auth / rate-limit / 5xx) carry no
+        research signal and must not pause a direction."""
+        return self._hypothesis_stats()[3]
 
     def _hypothesis_failure_counts(self):
-        counts = {}
-        for exp in self.trajectory.experiments:
-            if exp.status == "FAILED" and is_research_relevant(
-                classify_error(exp.error)
-            ):
-                counts[exp.hypothesis_id] = counts.get(exp.hypothesis_id, 0) + 1
-        return counts
+        return self._hypothesis_stats()[1]
 
     def _used_hypothesis_ids(self):
-        return {e.hypothesis_id for e in self.trajectory.experiments}
+        return self._hypothesis_stats()[0]
 
     def _last_used_round(self, hypothesis_id):
-        rounds = [
-            e.round
-            for e in self.trajectory.experiments
-            if e.hypothesis_id == hypothesis_id
-        ]
-        return max(rounds) if rounds else 0
+        return self._hypothesis_stats()[2].get(hypothesis_id, 0)
 
     # ---- validation & pool maintenance ----
 
@@ -567,6 +576,12 @@ class Agent:
         if not suspicious:
             return 0
         alt_fields = self._last_fields
+        # Collect every perturbation job first, then run them in a single
+        # scheduler pass. Per-record serial add_jobs+run() underutilized the
+        # worker pool (one thread pool spin-up + checkpoint round per record);
+        # one run lets concurrent validation jobs share the max_concurrent
+        # workers. The verdict is still decided per record afterwards.
+        groups = []
         validation_used = 0
         for rec in suspicious:
             if validation_used >= self.validation_budget:
@@ -579,12 +594,17 @@ class Agent:
             take = jobs[: self.validation_budget - validation_used]
             if not take:
                 break
-            scheduler.add_jobs(take)
-            scheduler.run()
+            groups.append((rec, take))
             validation_used += len(take)
-            results = [self._perturb_result(exp) for exp in take]
-            stable, _ = self.validator.decide(rec, results)
-            self._apply_validation(rec, stable, round_no, len(take))
+        if groups:
+            scheduler.add_jobs(
+                [job for _, take in groups for job in take]
+            )
+            scheduler.run()
+            for rec, take in groups:
+                results = [self._perturb_result(exp) for exp in take]
+                stable, _ = self.validator.decide(rec, results)
+                self._apply_validation(rec, stable, round_no, len(take))
         return validation_used
 
     def _apply_validation(self, rec, stable, round_no, sims):

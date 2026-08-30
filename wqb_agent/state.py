@@ -183,19 +183,24 @@ class Trajectory:
 
     def __init__(self, max_len=100):
         self.experiments = []
+        self._ids = set()
         self.max_len = max_len
         self.created_at = time.time()
         self.updated_at = time.time()
 
     def add(self, experiment):
         # Idempotent: a job restored from a scheduler checkpoint must not be
-        # recorded twice.
-        if any(e.id == experiment.id for e in self.experiments):
+        # recorded twice. An id set keeps the check O(1) instead of a scan.
+        if experiment.id in self._ids:
             return
         self.experiments.append(experiment)
+        self._ids.add(experiment.id)
         self.updated_at = time.time()
         if len(self.experiments) > self.max_len:
+            removed = self.experiments[: -self.max_len]
             self.experiments = self.experiments[-self.max_len:]
+            for exp in removed:
+                self._ids.discard(exp.id)
 
     def recent(self, n=20):
         return self.experiments[-n:]
@@ -217,6 +222,7 @@ class Trajectory:
         traj.experiments = [
             Experiment.from_dict(e) for e in data.get("experiments", [])
         ]
+        traj._ids = {e.id for e in traj.experiments}
         traj.created_at = data.get("created_at", traj.created_at)
         traj.updated_at = data.get("updated_at", traj.updated_at)
         return traj

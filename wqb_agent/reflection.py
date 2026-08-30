@@ -151,6 +151,13 @@ class Reflector:
         }
 
     def _learn(self, round_no, hypothesis, exp, verdict):
+        # The belief identity/claim is shared by every evidence-recording
+        # branch below; compute it once instead of re-deriving the field
+        # normalization per branch.
+        bkey = belief_identity(exp.hypothesis_id, exp.fields_used,
+                               hypothesis=hypothesis)
+        bclaim = belief_claim(exp.hypothesis_id, exp.fields_used,
+                              hypothesis=hypothesis)
         if exp.status in ("FAILED", "SUBMIT_UNKNOWN"):
             kind = verdict.get("kind", "RESEARCH")
             if not is_research_relevant(kind):
@@ -188,10 +195,8 @@ class Reflector:
                     "repeat_fail", self._direction_key(exp), round_no
                 )
             self.memory.record_evidence(
-                belief_identity(exp.hypothesis_id, exp.fields_used,
-                                  hypothesis=hypothesis),
-                belief_claim(exp.hypothesis_id, exp.fields_used,
-                             hypothesis=hypothesis),
+                bkey,
+                bclaim,
                 "contradict",
                 round_no,
                 source=self._source_of(exp),
@@ -213,10 +218,8 @@ class Reflector:
                 source=self._source_of(exp),
             )
             self.memory.record_evidence(
-                belief_identity(exp.hypothesis_id, exp.fields_used,
-                                  hypothesis=hypothesis),
-                belief_claim(exp.hypothesis_id, exp.fields_used,
-                             hypothesis=hypothesis),
+                bkey,
+                bclaim,
                 "support",
                 round_no,
                 source=self._source_of(exp),
@@ -235,10 +238,8 @@ class Reflector:
             # counts once robustness validation confirms it (or becomes a
             # contradiction when validation rejects it).
             self.memory.record_evidence(
-                belief_identity(exp.hypothesis_id, exp.fields_used,
-                                  hypothesis=hypothesis),
-                belief_claim(exp.hypothesis_id, exp.fields_used,
-                             hypothesis=hypothesis),
+                bkey,
+                bclaim,
                 "pending",
                 round_no,
                 source=self._source_of(exp),
@@ -253,10 +254,8 @@ class Reflector:
                 source=self._source_of(exp),
             )
             self.memory.record_evidence(
-                belief_identity(exp.hypothesis_id, exp.fields_used,
-                                  hypothesis=hypothesis),
-                belief_claim(exp.hypothesis_id, exp.fields_used,
-                             hypothesis=hypothesis),
+                bkey,
+                bclaim,
                 "support",
                 round_no,
                 source=self._source_of(exp),
@@ -279,10 +278,8 @@ class Reflector:
             # belief on these fields. Not a lesson to be text-merged with
             # successes (token similarity cannot decide polarity).
             self.memory.record_evidence(
-                belief_identity(exp.hypothesis_id, exp.fields_used,
-                                  hypothesis=hypothesis),
-                belief_claim(exp.hypothesis_id, exp.fields_used,
-                             hypothesis=hypothesis),
+                bkey,
+                bclaim,
                 "contradict",
                 round_no,
                 source=self._source_of(exp),

@@ -1,7 +1,10 @@
+import json
 import logging
+import os
 import re
 
 from .hypothesis import ContractViolation, has_field_semantics
+from .state import atomic_write_json
 
 logger = logging.getLogger("wqb.discovery")
 
@@ -61,16 +64,52 @@ class BudgetExhausted(Exception):
 
 
 class FieldDiscovery:
-    def __init__(self, client, pagination_limit=50, max_pages=20):
+    def __init__(self, client, pagination_limit=50, max_pages=20, cache_path=None):
         self.client = client
         self.pagination_limit = pagination_limit
         self.max_pages = max_pages
-        self._cache = {}  # (dataset_id, limit, offset) -> cached page payload
+        # (dataset_id, limit, offset) -> cached page payload. Persisted across
+        # processes (cache_path) so a crash or a fresh run reuses previously
+        # fetched datafield pages instead of burning Field API budget again.
+        self.cache_path = cache_path
+        self._cache = self._load_cache() if cache_path else {}
         self._budget = None
         self._calls = 0
         # Outcome of the last discover() call, so callers can tell an API
         # infrastructure failure apart from a genuine "no matching field".
         self.last_outcome = None
+
+    def _load_cache(self):
+        if not self.cache_path or not os.path.exists(self.cache_path):
+            return {}
+        try:
+            with open(self.cache_path) as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            # A corrupt cache must never break discovery; fall back to empty.
+            logger.warning("FIELD_CACHE_LOAD_FAILED path=%s", self.cache_path)
+            return {}
+        cache = {}
+        for key, payload in raw.items():
+            try:
+                dataset_id, limit, offset = key.split(":")
+                cache[(dataset_id, int(limit), int(offset))] = payload
+            except (ValueError, TypeError):
+                continue
+        return cache
+
+    def _save_cache(self):
+        if not self.cache_path:
+            return
+        raw = {
+            f"{dataset_id}:{limit}:{offset}": payload
+            for (dataset_id, limit, offset), payload in self._cache.items()
+        }
+        try:
+            atomic_write_json(self.cache_path, raw)
+        except OSError as exc:
+            logger.warning("FIELD_CACHE_SAVE_FAILED path=%s error=%s",
+                           self.cache_path, exc)
 
     def reset_budget(self, budget):
         """Per-round cap on new field-discovery API requests (0 = unlimited)."""
@@ -364,6 +403,9 @@ class FieldDiscovery:
                 and not chosen
                 and bool(outcome["succeeded"])
             )
+        # Persist every page fetched during this discover call in one write,
+        # instead of flushing on every _page hit.
+        self._save_cache()
         self.last_outcome = outcome
         return chosen
 

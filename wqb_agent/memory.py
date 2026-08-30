@@ -3,12 +3,18 @@ import os
 import re
 import time
 import uuid
+from functools import lru_cache
 
 from .diversity import lineage_root, select_diverse
 from .state import score_of
 
 PROMOTE_EVIDENCE = 3
 SHORT_LESSON_MAX_AGE_ROUNDS = 3
+
+
+def _evidence_key(experiment_id, polarity):
+    """Stable idempotency key for one (experiment, polarity) evidence record."""
+    return f"{experiment_id}|{polarity}"
 
 
 class ExperienceMemory:
@@ -92,6 +98,16 @@ class ExperienceMemory:
                 belief.get("contradiction_lineage_roots") or []
             )
             belief["source_rounds"] = set(belief.get("source_rounds") or [])
+            # Replay idempotency survives evidence_log truncation via a
+            # dedicated set. Rebuild it for older state that predates it.
+            evidence_ids = belief.get("evidence_ids")
+            if not evidence_ids:
+                evidence_ids = {
+                    _evidence_key(e.get("experiment_id"), e.get("polarity"))
+                    for e in belief.get("evidence_log", [])
+                    if e.get("experiment_id")
+                }
+            belief["evidence_ids"] = set(evidence_ids)
         return self
 
     def save(self):
@@ -194,11 +210,7 @@ class ExperienceMemory:
         belief = self._get_or_create_belief(belief_key, claim)
         if source:
             exp_id = source.get("experiment_id")
-            if exp_id and any(
-                e.get("experiment_id") == exp_id
-                and e.get("polarity") == polarity
-                for e in belief["evidence_log"]
-            ):
+            if exp_id and _evidence_key(exp_id, polarity) in belief["evidence_ids"]:
                 return belief
 
         root = self._lineage_root(source) if source else None
@@ -213,11 +225,17 @@ class ExperienceMemory:
                 belief["contradiction_lineage_roots"].add(root)
 
         if source:
+            exp_id = source.get("experiment_id")
+            if exp_id:
+                # Record the idempotency marker regardless of the truncated
+                # evidence_log: a replay of this experiment must be skipped
+                # even after its log entry has been evicted.
+                belief["evidence_ids"].add(_evidence_key(exp_id, polarity))
             log = belief.setdefault("evidence_log", [])
             log.insert(
                 0,
                 {
-                    "experiment_id": source.get("experiment_id"),
+                    "experiment_id": exp_id,
                     "polarity": polarity,
                     "kind": kind,
                     "round": source.get("round") or source_round,
@@ -241,13 +259,13 @@ class ExperienceMemory:
             "id": uuid.uuid4().hex[:8],
             "belief_key": belief_key,
             "claim": claim,
-            "polarity": "support",  # direction the claim asserts
             "support_count": 0,
             "contradiction_count": 0,
             "support_lineage_roots": set(),
             "contradiction_lineage_roots": set(),
             "source_rounds": set(),
             "evidence_log": [],
+            "evidence_ids": set(),
             "confidence": 0.5,
             "tier": "short",
             "created": time.time(),
@@ -566,14 +584,15 @@ class ExperienceMemory:
 
     @staticmethod
     def _similar(a, b, threshold=0.8):
-        ta = ExperienceMemory._tokens(a)
-        tb = ExperienceMemory._tokens(b)
+        ta = _tokens(a)
+        tb = _tokens(b)
         if not ta or not tb:
             return False
         inter = len(set(ta) & set(tb))
         union = len(set(ta) | set(tb))
         return inter / union >= threshold
 
-    @staticmethod
-    def _tokens(text):
-        return [w for w in re.split(r"[^a-z0-9]+", text.lower()) if len(w) > 2]
+
+@lru_cache(maxsize=256)
+def _tokens(text):
+    return [w for w in re.split(r"[^a-z0-9]+", text.lower()) if len(w) > 2]

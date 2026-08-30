@@ -212,6 +212,38 @@ class TestDiscoveryBudgetAndCache(unittest.TestCase):
         self.assertEqual(len(client.datafield_calls), first_calls)
 
 
+class TestFieldCachePersistence(unittest.TestCase):
+    """The field page cache must survive across processes: a fresh FieldDiscovery
+    over the same cache_path reuses previously fetched pages instead of burning
+    Field API budget again."""
+
+    def test_reuse_across_instances_skips_api(self):
+        tmpdir = tempfile.mkdtemp()
+        cache_path = os.path.join(tmpdir, "fields_cache.json")
+        h = _seed("h-seed-reversal")
+
+        client1 = FakeClient()
+        d1 = FieldDiscovery(client1, cache_path=cache_path)
+        d1.discover(h, target_count=4)
+        self.assertGreater(len(client1.datafield_calls), 0)
+        self.assertTrue(os.path.exists(cache_path))
+
+        client2 = FakeClient()
+        d2 = FieldDiscovery(client2, cache_path=cache_path)
+        fields2 = d2.discover(h, target_count=4)
+        self.assertEqual(client2.datafield_calls, [])
+        self.assertEqual(len(fields2), 4)
+
+    def test_corrupt_cache_falls_back_cleanly(self):
+        tmpdir = tempfile.mkdtemp()
+        cache_path = os.path.join(tmpdir, "fields_cache.json")
+        with open(cache_path, "w") as f:
+            f.write("{not valid json")
+        d = FieldDiscovery(FakeClient(), cache_path=cache_path)
+        fields = d.discover(_seed("h-seed-reversal"), target_count=2)
+        self.assertEqual(len(fields), 2)
+
+
 class TestInfraFailureClassification(unittest.TestCase):
     """An API timeout / 429 / auth / 5xx is an infrastructure failure and
     must never be read as 'the hypothesis has no matching field'."""

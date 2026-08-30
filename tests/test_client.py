@@ -292,15 +292,19 @@ class TestThreadLocalSession(unittest.TestCase):
         seen = {}
 
         def worker():
+            # Hold a reference to the session: id() of a temporary that is
+            # garbage-collected after the function returns can be reused by the
+            # next thread's brand-new Session, which would make distinct
+            # sessions look identical.
             sess = client._session()
-            seen[threading.current_thread().name] = id(sess)
+            seen[threading.current_thread().name] = sess
 
         threads = [threading.Thread(target=worker) for _ in range(4)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        self.assertEqual(len(set(seen.values())), 4)
+        self.assertEqual(len({id(s) for s in seen.values()}), 4)
 
 
 class TestExtractMetrics(unittest.TestCase):

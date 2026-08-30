@@ -4,7 +4,7 @@ Concurrency, budget and checkpointing live in BacktestScheduler; this module
 deliberately does not manage any shared mutable state.
 """
 
-from .failures import FailureKind
+from .failures import FailureKind, classify_error
 
 
 class Simulator:
@@ -64,19 +64,14 @@ class Simulator:
 
 
 def classify_experiment_failure(experiment):
-    """Convenience helper: map an experiment's error to a FailureKind."""
-    error = experiment.error or ""
-    if "WQBAuthError" in error:
-        return FailureKind.AUTH
-    if "WQBRateLimitError" in error or "429" in error:
-        return FailureKind.RATE_LIMIT
-    if "WQBTimeoutError" in error or "timed out" in error.lower():
-        return FailureKind.TIMEOUT
-    if "WQBRejectedError" in error or "422" in error or "400" in error:
-        return FailureKind.SYNTAX
-    if "WQBNotFoundError" in error or "404" in error:
-        return FailureKind.DATA
-    return FailureKind.INFRA
+    """Convenience helper: map an experiment's error to a FailureKind.
+
+    Delegates to the single failure taxonomy in failures.py so the error
+    classification stays in one place; the experiment error text carries the
+    typed exception name (e.g. ``WQBRateLimitError``) which the taxonomy
+    regexes recognize directly.
+    """
+    return classify_error(experiment.error or "")
 
 
 def _extract_metrics(payload):

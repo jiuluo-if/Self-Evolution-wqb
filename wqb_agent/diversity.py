@@ -210,7 +210,8 @@ def _near_identical_expression(expr_a, expr_b, threshold=0.85):
     return len(ta & tb) / len(ta | tb) >= threshold
 
 
-def is_redundant(record, pool_records, expr_th=0.6, field_th=0.5):
+def is_redundant(record, pool_records, expr_th=0.6, field_th=0.5,
+                 _pool_fps=None):
     """Multi-dimensional redundancy against an existing set.
 
     Precedence:
@@ -221,11 +222,16 @@ def is_redundant(record, pool_records, expr_th=0.6, field_th=0.5):
     3. Same hypothesis + same operator family + overlapping fields +
        compatible datasets -> redundant.
     4. Token-level near-duplicates (legacy behaviour).
+
+    ``_pool_fps`` is an optional pre-computed fingerprint list parallel to
+    ``pool_records``; batch callers (filter_candidates) pass it to avoid
+    re-running the fingerprint regexes for every candidate.
     """
     fa = fingerprint(record)
     expr_a = _record_expr(record)
-    for rec in pool_records:
-        fb = fingerprint(rec)
+    if _pool_fps is None:
+        _pool_fps = [fingerprint(rec) for rec in pool_records]
+    for rec, fb in zip(pool_records, _pool_fps):
         if _different_hypotheses(fa, fb):
             if _near_identical_expression(expr_a, _record_expr(rec)):
                 return True, rec
@@ -407,7 +413,12 @@ def filter_candidates(candidates, simulated_exprs, pool_records, allow_research_
     ``(candidate, reason)``.
     """
     simulated = set(simulated_exprs or [])
+    pool = list(pool_records or [])
+    # Pre-compute fingerprints once; is_redundant is called per candidate and
+    # kept grows, so re-deriving them per call would be quadratic.
+    pool_fps = [fingerprint(rec) for rec in pool]
     kept = []
+    kept_fps = []
     blocked = []
     for cand in candidates:
         expr = cand.get("expression") or ""
@@ -416,12 +427,16 @@ def filter_candidates(candidates, simulated_exprs, pool_records, allow_research_
             continue
         if allow_research_mutation and _is_research_mutation(cand):
             kept.append(cand)
+            kept_fps.append(fingerprint(cand))
             continue
-        redundant, _ = is_redundant(cand, list(pool_records or []) + kept)
+        redundant, _ = is_redundant(
+            cand, pool + kept, _pool_fps=pool_fps + kept_fps
+        )
         if redundant:
             blocked.append((cand, "redundant"))
             continue
         kept.append(cand)
+        kept_fps.append(fingerprint(cand))
     return kept, blocked
 
 

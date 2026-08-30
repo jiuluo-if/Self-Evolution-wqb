@@ -625,6 +625,37 @@ class TestBeliefIdentity(unittest.TestCase):
                              hypothesis=self.REV)
         self.assertEqual(k, k2)
 
+    def test_replay_idempotency_survives_log_truncation(self):
+        memory = _fresh_memory()
+        k = belief_identity("h-seed-reversal", ["returns"],
+                            hypothesis=self.REV)
+        # Fill the evidence_log past its 30-entry bound so the first entry is
+        # evicted; a replay of that first experiment must still be skipped.
+        for i in range(35):
+            memory.record_evidence(
+                k, "c", "support", 1,
+                source=self._source(f"e{i}", 1),
+            )
+        self.assertEqual(len(memory.get_belief(k)["evidence_log"]), 30)
+        memory.record_evidence(
+            k, "c", "support", 1,
+            source=self._source("e0", 1),
+        )
+        b = memory.get_belief(k)
+        self.assertEqual(b["support_count"], 35)
+
+    def test_replay_idempotency_survives_save_load(self):
+        memory = _fresh_memory()
+        k = belief_identity("h-seed-reversal", ["returns"],
+                            hypothesis=self.REV)
+        memory.record_evidence(k, "c", "support", 1,
+                               source=self._source("e1", 1))
+        memory.save()
+        loaded = ExperienceMemory(state_dir=memory.state_dir).load()
+        loaded.record_evidence(k, "c", "support", 1,
+                               source=self._source("e1", 1))
+        self.assertEqual(loaded.get_belief(k)["support_count"], 1)
+
     def test_add_avoid_keeps_history(self):
         memory = _fresh_memory()
         memory.add_avoid("d1", "r1", 1,
