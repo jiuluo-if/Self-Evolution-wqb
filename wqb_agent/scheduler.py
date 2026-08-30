@@ -321,7 +321,7 @@ class BacktestScheduler:
             }
             tmp = self.checkpoint_path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(data, f, indent=2)
+                json.dump(data, f)
             os.replace(tmp, self.checkpoint_path)
         logger.info("CHECKPOINT_SAVED path=%s completed=%d failed=%d",
                     self.checkpoint_path, len(self._completed),

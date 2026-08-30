@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -121,6 +122,24 @@ class TestSchedulerCheckpoint(unittest.TestCase):
         scheduler.run()
         self.assertTrue(os.path.exists(path))
         self.assertFalse(os.path.exists(path + ".tmp"))
+
+    def test_checkpoint_is_compact_machine_json(self):
+        tmpdir = tempfile.mkdtemp()
+        path = self._path(tmpdir)
+        client = FakeClient()
+        scheduler = BacktestScheduler(
+            client, Simulator(client), max_concurrent=2, budget=10,
+            checkpoint_path=path, checkpoint_every=1,
+        )
+        scheduler.add_jobs(make_experiments([f"rank(f{i})" for i in range(3)]))
+        scheduler.run()
+        # A checkpoint is a resume artifact, not a document: it must round-trip
+        # through json.load and stay compact (no pretty-print indentation).
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(len(data["completed"]), 3)
+        with open(path) as f:
+            self.assertNotIn("\n  \"completed\"", f.read())
 
     def test_resume_does_not_rerun_completed(self):
         tmpdir = tempfile.mkdtemp()

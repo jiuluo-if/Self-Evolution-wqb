@@ -5,10 +5,15 @@ import uuid
 
 
 def atomic_write_json(path, data):
-    """Write JSON atomically via tmp + os.replace()."""
+    """Write JSON atomically via tmp + os.replace().
+
+    State files are machine-resume snapshots, so no indentation is produced:
+    a compact payload dumps faster and occupies less disk than a human-edited
+    one, and ``json.load`` reads either form identically.
+    """
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(data, f, indent=2, default=_json_default)
+        json.dump(data, f, default=_json_default)
     os.replace(tmp, path)
 
 

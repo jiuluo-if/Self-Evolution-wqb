@@ -14,6 +14,7 @@ deterministic; no embeddings and no learned ranking.
 """
 
 import re
+from functools import lru_cache
 
 from .state import score_of
 
@@ -24,6 +25,8 @@ _WORD_BOUNDARY_RE = re.compile(r"(?<![\w])")
 _CALL_RE = re.compile(r"\b([a-z_]+)\(")
 
 _TS_WINDOW_RE = re.compile(r"\bts_[a-z_]+\([^)]*,\s*(\d+)\)")
+
+_TRAILING_DIGITS_RE = re.compile(r"\d+$")
 
 _KNOWN_OPS = {
     "rank",
@@ -45,6 +48,15 @@ _KNOWN_OPS = {
 }
 
 
+@lru_cache(maxsize=1024)
+def _field_boundary_pattern(field_id):
+    """Compile the word-boundary match for one field id once; extract_fields
+    reuses it across candidates instead of re-compiling per search."""
+    return re.compile(
+        _WORD_BOUNDARY_RE.pattern + re.escape(field_id) + r"(?![\w])"
+    )
+
+
 def extract_fields(expression, known_fields):
     """Return the subset of known_fields that actually appear in the expression.
 
@@ -56,8 +68,7 @@ def extract_fields(expression, known_fields):
     for fid in sorted(dict.fromkeys(known_fields or []), key=len, reverse=True):
         if not fid:
             continue
-        pattern = _WORD_BOUNDARY_RE.pattern + re.escape(fid) + r"(?![\w])"
-        if re.search(pattern, expression):
+        if _field_boundary_pattern(fid).search(expression):
             found.append(fid)
     return found
 
@@ -130,7 +141,7 @@ def dataset_family(dataset_id):
     """Canonical family of a dataset id: trailing digits stripped. ``pv1`` and
     ``pv13`` both belong to the ``pv`` family."""
     d = str(dataset_id or "")
-    return re.sub(r"\d+$", "", d) or d
+    return _TRAILING_DIGITS_RE.sub("", d) or d
 
 
 def operator_family(expression):

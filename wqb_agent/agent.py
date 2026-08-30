@@ -230,6 +230,10 @@ SEED_HYPOTHESES = [
     },
 ]
 
+# Lookup index for belief derivation; _hypothesis_of hits it instead of
+# scanning the whole list for every validated record.
+_HYPOTHESES_BY_ID = {h["id"]: h for h in SEED_HYPOTHESES}
+
 
 class Agent:
     def __init__(self, client, config):
@@ -666,10 +670,7 @@ class Agent:
         """Look up the hypothesis dict by id for belief derivation. Only the
         id is looked up here; the belief key itself is built by the single
         canonical helper in `beliefs.py`, shared with the Reflector."""
-        for h in SEED_HYPOTHESES:
-            if h["id"] == hypothesis_id:
-                return h
-        return None
+        return _HYPOTHESES_BY_ID.get(hypothesis_id)
 
     def _belief_key_of(self, rec):
         return belief_identity(
