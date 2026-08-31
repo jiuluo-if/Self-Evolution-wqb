@@ -57,6 +57,13 @@ def _field_boundary_pattern(field_id):
     )
 
 
+@lru_cache(maxsize=64)
+def _sorted_field_ids(fields):
+    """Longest-first field ids; the ordering depends only on the field set,
+    so candidate construction computes it once instead of per expression."""
+    return sorted(dict.fromkeys(fields), key=len, reverse=True)
+
+
 def extract_fields(expression, known_fields):
     """Return the subset of known_fields that actually appear in the expression.
 
@@ -65,7 +72,7 @@ def extract_fields(expression, known_fields):
     """
     expression = expression or ""
     found = []
-    for fid in sorted(dict.fromkeys(known_fields or []), key=len, reverse=True):
+    for fid in _sorted_field_ids(tuple(known_fields or ())):
         if not fid:
             continue
         if _field_boundary_pattern(fid).search(expression):
@@ -456,9 +463,16 @@ def filter_candidates(candidates, simulated_exprs, pool_records, allow_research_
             kept.append(cand)
             kept_fps.append(fingerprint(cand))
             continue
+        # Check the pool and the already-kept candidates separately instead of
+        # concatenating lists per candidate; the first redundant match wins in
+        # the original pool-first order, so the boolean verdict is identical.
         redundant, _ = is_redundant(
-            cand, pool + kept, _pool_fps=pool_fps + kept_fps
+            cand, pool, _pool_fps=pool_fps
         )
+        if not redundant:
+            redundant, _ = is_redundant(
+                cand, kept, _pool_fps=kept_fps
+            )
         if redundant:
             blocked.append((cand, "redundant"))
             continue

@@ -51,6 +51,7 @@ class ExperienceMemory:
         self.submission_pool = []  # list of AlphaRecord dicts
         self.lessons = []  # tier: "long" | "short"
         self.beliefs = []  # Claim -> {support, contradiction} -> confidence
+        self._belief_index = {}  # belief_key -> belief (O(1) lookup)
         self.avoid = []
         self.next = []
         self.active_lineages = []  # {expression, lineage, attempts, best_score, last_round}
@@ -108,6 +109,7 @@ class ExperienceMemory:
                     if e.get("experiment_id")
                 }
             belief["evidence_ids"] = set(evidence_ids)
+        self._belief_index = {b.get("belief_key"): b for b in self.beliefs}
         return self
 
     def save(self):
@@ -177,10 +179,7 @@ class ExperienceMemory:
     # ---- beliefs (Claim -> Supporting + Contradicting evidence -> Confidence) ----
 
     def get_belief(self, belief_key):
-        for belief in self.beliefs:
-            if belief["belief_key"] == belief_key:
-                return belief
-        return None
+        return self._belief_index.get(belief_key)
 
     def record_evidence(
         self,
@@ -272,6 +271,7 @@ class ExperienceMemory:
             "updated": time.time(),
         }
         self.beliefs.append(entry)
+        self._belief_index[belief_key] = entry
         return entry
 
     @staticmethod
