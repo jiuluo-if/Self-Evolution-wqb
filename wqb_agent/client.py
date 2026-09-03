@@ -119,14 +119,13 @@ class WQBClient:
                     ) from exc
                 time.sleep(self._backoff(attempt - 1))
                 continue
-            if resp.status_code == 200 or resp.status_code in (301, 302, 303):
+            if resp.status_code in (200, 301, 302, 303):
                 self._set_authenticated(True)
                 return
             if resp.status_code == 401:
                 raise WQBAuthError("Authentication rejected by WorldQuant BRAIN (401).")
             if resp.status_code == 429:
-                retry = float(resp.headers.get("Retry-After", 5))
-                time.sleep(min(retry, 30))
+                self._sleep_retry_after(resp)
             else:
                 raise WQBSimulationError(
                     f"Authentication failed with status {resp.status_code}."
@@ -196,14 +195,14 @@ class WQBClient:
             except requests.exceptions.Timeout as exc:
                 if not retry_ambiguous or attempt >= self.max_retries - 1:
                     raise WQBTimeoutError(
-                        f"{context} timed out after {self.max_retries} attempts."
+                        f"{context} timed out after {attempt + 1} attempts."
                     ) from exc
                 time.sleep(self._backoff(attempt))
                 continue
             except requests.exceptions.RequestException as exc:
                 if not retry_ambiguous or attempt >= self.max_retries - 1:
                     raise WQBSimulationError(
-                        f"{context} network error after {self.max_retries} "
+                        f"{context} network error after {attempt + 1} "
                         f"attempts: {exc}"
                     ) from exc
                 time.sleep(self._backoff(attempt))
@@ -217,6 +216,13 @@ class WQBClient:
                 continue
             if resp.status_code == 429:
                 self._sleep_retry_after(resp)
+                # A persistent rate limit is a confirmed non-acceptance, not an
+                # ambiguous outcome: surface it as RATE_LIMIT so the scheduler
+                # can distinguish it from a lost backend response.
+                if attempt >= self.max_retries - 1:
+                    raise self._classified_exception(
+                        resp.status_code, resp.text, context
+                    )
                 continue
             if resp.status_code in FAIL_FAST_STATUSES:
                 raise self._classified_exception(
@@ -233,10 +239,6 @@ class WQBClient:
         raise WQBSimulationError(f"{context} exceeded retries.")
 
     # ---- API ----
-
-    def get_datasets(self):
-        resp = self._request("GET", f"{self.base_url}/datasets", context="GET /datasets")
-        return resp.json().get("results", [])
 
     def get_datafields(self, dataset_id, limit=50, offset=0):
         resp = self._request(
@@ -289,9 +291,9 @@ class WQBClient:
                 self._ensure_auth()
                 continue
             if resp.status_code == 429:
-                self._sleep_retry_after(resp)
                 if time.time() - start > timeout_sec:
                     raise WQBTimeoutError("Simulation polling timed out.")
+                self._sleep_retry_after(resp)
                 continue
             if resp.status_code in FAIL_FAST_STATUSES:
                 raise self._classified_exception(
@@ -317,16 +319,10 @@ class WQBClient:
                 )
             if time.time() - start > timeout_sec:
                 raise WQBTimeoutError("Simulation polling timed out.")
-            delay = float(retry_after) if retry_after else 5.0
-            time.sleep(min(delay, 30))
+            self._sleep_retry_after(resp)
 
     def get_alpha(self, alpha_id):
         resp = self._request(
             "GET", f"{self.base_url}/alphas/{alpha_id}", context=f"GET alpha {alpha_id}"
         )
         return resp.json()
-
-    def run_simulation(self, expression, settings, timeout_sec=900):
-        progress_url = self.submit_simulation(expression, settings)
-        alpha_id = self.poll_progress(progress_url, timeout_sec=timeout_sec)
-        return self.get_alpha(alpha_id)

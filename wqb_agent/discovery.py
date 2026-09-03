@@ -112,7 +112,11 @@ class FieldDiscovery:
                            self.cache_path, exc)
 
     def reset_budget(self, budget):
-        """Per-round cap on new field-discovery API requests (0 = unlimited)."""
+        """Per-round cap on new field-discovery API requests.
+
+        ``None`` means unlimited; ``0`` disables new requests. Cache hits do
+        not count toward the budget.
+        """
         self._budget = budget
         self._calls = 0
 

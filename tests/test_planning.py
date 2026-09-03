@@ -46,7 +46,7 @@ class TestPlanning(unittest.TestCase):
             e.error = "WQBRejectedError: 422 invalid"
             agent.trajectory.add(e)
         self.assertIn("h-seed-reversal", agent._parked_hypotheses())
-        chosen = agent._choose_hypothesis(2)
+        chosen = agent._choose_hypothesis()
         self.assertNotEqual(chosen["id"], "h-seed-reversal")
 
     def test_infra_failures_do_not_park_hypothesis(self):
@@ -91,7 +91,7 @@ class TestPlanning(unittest.TestCase):
         e.status = "DONE"
         e.metrics = {"sharpe": 0.5, "fitness": 0.5, "checks": [], "passed": None}
         agent.trajectory.add(e)
-        chosen = agent._choose_hypothesis(2)
+        chosen = agent._choose_hypothesis()
         self.assertNotEqual(chosen["id"], "h-seed-analyst")
 
     def test_memory_next_and_lineages_steer_next_round(self):

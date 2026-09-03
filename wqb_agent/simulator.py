@@ -4,8 +4,6 @@ Concurrency, budget and checkpointing live in BacktestScheduler; this module
 deliberately does not manage any shared mutable state.
 """
 
-from .failures import FailureKind, classify_error
-
 
 class Simulator:
     def __init__(self, client, max_concurrent=3, poll_timeout_sec=900):
@@ -14,7 +12,7 @@ class Simulator:
         self.max_concurrent = max_concurrent
         self.poll_timeout_sec = poll_timeout_sec
 
-    def submit(self, experiment, poll_timeout_sec=None):
+    def submit(self, experiment):
         """Create the remote simulation and persist its progress URL on the
         experiment. The caller (scheduler) checkpoint()s right after this
         returns so a crash can resume polling instead of re-submitting."""
@@ -37,17 +35,6 @@ class Simulator:
         experiment.metrics = _extract_metrics(payload)
         experiment.status = "DONE"
 
-    def simulate(self, experiment, poll_timeout_sec=None):
-        """Execute exactly one simulation and update the experiment in place."""
-        experiment.status = "PENDING"
-        try:
-            self.submit(experiment, poll_timeout_sec=poll_timeout_sec)
-            self.poll(experiment, poll_timeout_sec=poll_timeout_sec)
-        except Exception as exc:  # noqa: BLE001
-            experiment.error = f"{type(exc).__name__}: {exc}"
-            experiment.status = "FAILED"
-        return experiment
-
     def run(self, experiments):
         """Backward-compatible convenience wrapper around the scheduler."""
         from .scheduler import BacktestScheduler
@@ -61,17 +48,6 @@ class Simulator:
         scheduler.add_jobs(experiments)
         scheduler.run()
         return experiments
-
-
-def classify_experiment_failure(experiment):
-    """Convenience helper: map an experiment's error to a FailureKind.
-
-    Delegates to the single failure taxonomy in failures.py so the error
-    classification stays in one place; the experiment error text carries the
-    typed exception name (e.g. ``WQBRateLimitError``) which the taxonomy
-    regexes recognize directly.
-    """
-    return classify_error(experiment.error or "")
 
 
 def _extract_metrics(payload):

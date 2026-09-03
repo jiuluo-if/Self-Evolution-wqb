@@ -167,34 +167,25 @@ class Reflector:
                 # memory and garbage. They never count as support or
                 # contradiction for any belief.
                 return
+            direction = self._direction_key(exp)
+            # Every research-relevant failure teaches what not to try again.
+            # The avoid entry is updated (or created) and the direction is
+            # archived so the failure is never silently forgotten.
+            self.memory.add_avoid(
+                direction,
+                self._diagnose_error(exp),
+                round_no,
+                source=source,
+            )
+            self.memory.archive("repeat_fail", direction, round_no)
             if kind in (FailureKind.SYNTAX, FailureKind.DATA):
                 # Expression construction / data failures teach how to build
                 # the expression, never whether the economic hypothesis is
                 # wrong. They stay in avoid as construction lessons and do not
                 # enter belief accounting.
-                self.memory.add_avoid(
-                    self._direction_key(exp),
-                    self._diagnose_error(exp),
-                    round_no,
-                    source=source,
-                )
-                if self.memory.is_avoided(self._direction_key(exp)):
-                    self.memory.archive(
-                        "repeat_fail", self._direction_key(exp), round_no
-                    )
                 return
             # A valid RESEARCH failure (low sharpe / failed checks with metrics)
             # is financial negative evidence for the belief on these fields.
-            self.memory.add_avoid(
-                self._direction_key(exp),
-                self._diagnose_error(exp),
-                round_no,
-                source=source,
-            )
-            if self.memory.is_avoided(self._direction_key(exp)):
-                self.memory.archive(
-                    "repeat_fail", self._direction_key(exp), round_no
-                )
             self.memory.record_evidence(
                 bkey,
                 bclaim,

@@ -17,7 +17,7 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from .failures import FailureKind, classify_error
-from .state import Experiment
+from .state import Experiment, atomic_write_json
 
 logger = logging.getLogger("wqb.scheduler")
 
@@ -231,7 +231,7 @@ class BacktestScheduler:
                 exp.status = "SUBMITTING"
                 self._checkpoint()
                 try:
-                    self.simulator.submit(exp, poll_timeout_sec=self.poll_timeout_sec)
+                    self.simulator.submit(exp)
                 except Exception as exc:  # noqa: BLE001
                     if self._submit_outcome_known(exc):
                         raise
@@ -319,10 +319,7 @@ class BacktestScheduler:
                 ],
                 "failed": [exp.to_dict() for exp in self._failed.values()],
             }
-            tmp = self.checkpoint_path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp, self.checkpoint_path)
+            atomic_write_json(self.checkpoint_path, data)
         logger.info("CHECKPOINT_SAVED path=%s completed=%d failed=%d",
                     self.checkpoint_path, len(self._completed),
                     len(self._failed))
@@ -491,6 +488,3 @@ class BacktestScheduler:
 
     def completed_experiments(self):
         return list(self._completed.values())
-
-    def failed_experiments(self):
-        return list(self._failed.values())

@@ -496,7 +496,7 @@ class Agent:
                 deepen += 1
                 explore = max(0, n - deepen)
 
-        hypothesis = self._choose_hypothesis(round_no)
+        hypothesis = self._choose_hypothesis()
         # A research contract is mandatory before any candidate is built or
         # simulated: the system must already know the mechanism, the field
         # meaning, the expected sign and horizon, and the failure condition.
@@ -506,7 +506,7 @@ class Agent:
             "split": {"explore": explore, "deepen": deepen},
         }
 
-    def _choose_hypothesis(self, round_no):
+    def _choose_hypothesis(self):
         used, failure_counts, last_used, parked = self._hypothesis_stats()
         available = [h for h in SEED_HYPOTHESES if h["id"] not in parked]
         unused = [h for h in available if h["id"] not in used]
@@ -526,8 +526,8 @@ class Agent:
 
     def _hypothesis_stats(self):
         """One traversal of the trajectory producing every statistic the
-        hypothesis-selection logic needs: used hypothesis ids, per-hypothesis
-        research-failure counts, last-used round, and parked hypotheses.
+        hypothesis-selection logic needs: per-hypothesis research-failure
+        counts, last-used round, and parked hypotheses.
 
         The selection helpers below are thin wrappers around it so tests keep
         calling the named accessors while a single pass serves the planner.
@@ -567,12 +567,6 @@ class Agent:
     def _hypothesis_failure_counts(self):
         return self._hypothesis_stats()[1]
 
-    def _used_hypothesis_ids(self):
-        return self._hypothesis_stats()[0]
-
-    def _last_used_round(self, hypothesis_id):
-        return self._hypothesis_stats()[2].get(hypothesis_id, 0)
-
     # ---- validation & pool maintenance ----
 
     def _validate_suspicious(self, scheduler, summary, round_no):
@@ -596,8 +590,6 @@ class Agent:
             if not jobs:
                 continue
             take = jobs[: self.validation_budget - validation_used]
-            if not take:
-                break
             groups.append((rec, take))
             validation_used += len(take)
         if groups:
@@ -729,7 +721,7 @@ class Agent:
         remaining = []
         for item in self.memory.active_lineages:
             if (
-                item.get("attempts", 0) >= self.max_deepen_per_lineage + 1
+                item.get("attempts", 0) >= self.max_deepen_per_lineage
                 and item.get("best_score", -1) < self.good_fitness
             ):
                 pruned.append(item)

@@ -5,8 +5,8 @@ import time
 import uuid
 from functools import lru_cache
 
-from .diversity import lineage_root, select_diverse
-from .state import score_of
+from .diversity import select_diverse
+from .state import atomic_write_json, score_of
 
 PROMOTE_EVIDENCE = 3
 SHORT_LESSON_MAX_AGE_ROUNDS = 3
@@ -129,17 +129,7 @@ class ExperienceMemory:
             "recent_rounds": self.recent_rounds,
             "updated_round": self.updated_round,
         }
-        path = self.memory_path()
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, default=self._json_default)
-        os.replace(tmp, path)
-
-    @staticmethod
-    def _json_default(obj):
-        if isinstance(obj, set):
-            return list(obj)
-        return str(obj)
+        atomic_write_json(self.memory_path(), data)
 
     # ---- lessons (long-term candidates) ----
 
@@ -207,10 +197,9 @@ class ExperienceMemory:
           support never overwrites the contradiction history
         """
         belief = self._get_or_create_belief(belief_key, claim)
-        if source:
-            exp_id = source.get("experiment_id")
-            if exp_id and _evidence_key(exp_id, polarity) in belief["evidence_ids"]:
-                return belief
+        exp_id = source.get("experiment_id") if source else None
+        if exp_id and _evidence_key(exp_id, polarity) in belief["evidence_ids"]:
+            return belief
 
         root = self._lineage_root(source) if source else None
         belief["source_rounds"].add(source_round)
@@ -224,7 +213,6 @@ class ExperienceMemory:
                 belief["contradiction_lineage_roots"].add(root)
 
         if source:
-            exp_id = source.get("experiment_id")
             if exp_id:
                 # Record the idempotency marker regardless of the truncated
                 # evidence_log: a replay of this experiment must be skipped
@@ -382,10 +370,7 @@ class ExperienceMemory:
                 "updated": time.time(),
             }
         )
-
-    def top_next(self, n=5):
-        ordered = sorted(self.next, key=lambda x: -x.get("priority", 0))
-        return ordered[:n]
+        return self.next[-1]
 
     def is_avoided(self, direction):
         return any(item["direction"] == direction for item in self.avoid)
@@ -429,16 +414,6 @@ class ExperienceMemory:
         self.submission_pool = [
             r for r in self.submission_pool if r["id"] != alpha_id
         ]
-
-    def update_alpha_status(self, alpha_id, status):
-        for rec in self.submission_pool:
-            if rec["id"] == alpha_id:
-                rec["status"] = status
-                return rec
-        return None
-
-    def pool_exprs(self):
-        return {r["expression"] for r in self.submission_pool}
 
     def _trim_pool(self):
         """Keep the pool at max_pool via diversified greedy selection, not a
@@ -502,7 +477,7 @@ class ExperienceMemory:
         selected = []
         root_counts = {}
         for item in candidates:
-            root = lineage_root(item)
+            root = self._lineage_root(item)
             if root and root_counts.get(root, 0) >= max_per_lineage:
                 continue
             selected.append(item)
@@ -565,22 +540,6 @@ class ExperienceMemory:
         ]
         self._trim_pool()
         self._trim_lineages()
-
-    # ---- helpers ----
-
-    def long_term_view(self):
-        """Read-only view of reliable long-term knowledge."""
-        return {
-            "lessons": [l for l in self.lessons if l.get("tier") == "long"],
-            "beliefs": [b for b in self.beliefs if b.get("tier") == "long"],
-            "avoid": list(self.avoid),
-        }
-
-    def short_term_view(self):
-        return {
-            "next": list(self.next),
-            "active_lineages": list(self.active_lineages),
-        }
 
     @staticmethod
     def _similar(a, b, threshold=0.8):
